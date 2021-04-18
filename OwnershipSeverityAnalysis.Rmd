@@ -1,0 +1,2998 @@
+---
+title: "PublicPrivate_Red"
+author: "Jacob Levine"
+date: "7/10/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Table of Contents:
+0. Load Packages
+1. Data Management
+  1.1 Fire List
+  1.2 Severity and Patch ID
+  1.3 Ownership
+  1.4 Topography
+  1.5 Weather 
+  1.6 Autocovariate calculation
+  1.7 
+  1.8 Cleaning
+2. Data Exploration
+3. Model Fitting
+  3.1 For individual fires
+  3.2 For each fire
+4. Figure Generation
+
+##0. Load Packages
+```{r}
+
+package.list <- c("raster", "rgdal", "reshape2", "ggplot2", "car", "MASS", "gstat", "spdep", "sf", "splitstackshape", "lme4", "speedglm", "paralell", "mixmeta")
+
+lapply(package.list, require, character.only = TRUE)
+
+```
+
+
+##1. Data Management
+
+```{r}
+## set working directory
+setwd("~/block_storage/Dropbox (Stephens Lab)")
+
+## data management utility function
+.ls.objects <- function (pos = 1, pattern, order.by,
+                        decreasing=FALSE, head=FALSE, n=5) {
+    napply <- function(names, fn) sapply(names, function(x)
+                                         fn(get(x, pos = pos)))
+    names <- ls(pos = pos, pattern = pattern)
+    obj.class <- napply(names, function(x) as.character(class(x))[1])
+    obj.mode <- napply(names, mode)
+    obj.type <- ifelse(is.na(obj.class), obj.mode, obj.class)
+    obj.prettysize <- napply(names, function(x) {
+                           format(utils::object.size(x), units = "auto") })
+    obj.size <- napply(names, object.size)
+    obj.dim <- t(napply(names, function(x)
+                        as.numeric(dim(x))[1:2]))
+    vec <- is.na(obj.dim)[, 1] & (obj.type != "function")
+    obj.dim[vec, 1] <- napply(names, length)[vec]
+    out <- data.frame(obj.type, obj.size, obj.prettysize, obj.dim)
+    names(out) <- c("Type", "Size", "PrettySize", "Length/Rows", "Columns")
+    if (!missing(order.by))
+        out <- out[order(out[[order.by]], decreasing=decreasing), ]
+    if (head)
+        out <- head(out, n)
+    out
+}
+
+# shorthand
+lsos <- function(..., n=10) {
+    .ls.objects(..., order.by="Size", decreasing=TRUE, head=TRUE, n=n)
+}
+
+```
+
+
+####1.2 Severity and Patch ID
+```{r}
+
+## set filepaths
+fp_int <- "REMOTE/SevOwnership-main/Data/Intermediate/"
+fp_orig <- "REMOTE/SevOwnership-main/Data/Original/"
+
+## upload perimeter shapefile
+pers <- st_read(paste0(fp_int, "study_pers.shp"))
+fire.data <- as.data.frame(pers)[,1:10]
+
+## get filenames from directory
+files <- list.files(paste0(fp_orig, "so_cbi/"))
+
+## reproject fire perimeter data
+pers <- st_transform(pers, crs(raster(paste0(fp_orig, "so_cbi/", files[1]))))
+
+## vegetation file
+mixedcon <- raster("REMOTE/SevOwnership-main/Data/Intermediate/mixedcon.tif")
+
+## reclass matrix for severity data
+rc_matrix <- matrix(c(0, 2.25, 2.25, 3, 0, 1), nrow = 2)
+
+
+####### OWNERSHIP PREP #########
+
+## load in total ownership data 
+ownership.shp <- st_read(paste0(fp_orig, "ownership15_1.shp"))
+ownership.shp <- st_transform(ownership.shp, crs(raster(paste0(fp_orig, "so_cbi/", files[1]))))
+ownership.shp <- st_make_valid(ownership.shp)
+ownership.shp <- st_collection_extract(ownership.shp, type = "POLYGON")
+
+##get summary stats
+empty.raster <- raster(extent(pers), res = 0.0002694946)
+ownership.fullraster <- fasterize(ownership.shp, empty.raster, field = "Own_Group")
+ext <- extract(ownership.fullraster, pers)
+ext.ul <- unlist(ext)
+ext.ul <- ext.ul[!is.na(ext.ul)]
+fun <- function(i) {
+  prop <- sum(ext.ul == i) / length(ext.ul)
+  return(prop)
+}
+
+## transform to dataframe in order to create grouping data
+ownership.df <- as.data.frame(ownership.shp)
+ownership.df$Group_ID <- NA
+
+## create ownership type mapping: 0 = other, 1 = Private Industrial, 2 = Public Land
+own_class_mapping <- data.frame(Own_Group = unique(ownership.df$Own_Group), Group_ID = c(rep(2, times = 10), 0, rep(2, times = 3)))
+
+for (i in 1:14) {
+  ownership.df[ownership.df$Own_Group == own_class_mapping$Own_Group[i], "Group_ID"] <- own_class_mapping$Group_ID[i]
+}
+
+ownership.shp$Group_ID <- ownership.df$Group_ID
+ownership.shp <- st_collection_extract(ownership.shp, type = "POLYGON")
+
+## do same for private industrial land
+ownership_private.shp <- st_read(paste0(fp_orig, "Forest_Industry_Owners_18_2.shp"))
+ownership_private.shp <- st_transform(ownership_private.shp, crs(raster(paste0(fp_orig, "so_cbi/", files[1]))))
+ownership_private.shp <- st_make_valid(ownership_private.shp)
+ownership_private.shp$Group_ID <- 1
+
+
+##### TOPOGRAPHY PREP ####
+
+## read in DEM  
+DEM <- raster(paste0(fp_int, "output_srtm.tif"))
+DEM <- projectRaster(DEM, res = res(raster(paste0(fp_orig, "so_cbi/", files[1]))), crs = crs(raster(paste0(fp_orig, "so_cbi/", files[1])))) ## reproject
+
+## calculate TPI, this takes some time
+TPI <- tpi(DEM, scale = 21) ## consider pixels within a 300m by 300m square
+
+## calculate aspect
+aspect <- terrain(DEM, "aspect", unit = "degrees", neighbors = 8)
+
+## calculate slope
+slope <- terrain(DEM, "slope", unit = "degrees", neighbors = 8)
+
+
+```
+
+
+####1.3 Process severity, ownership and topography data
+```{R}
+
+## function to process severity data
+process_severity <- function(years, filelist, firelist) {
+  
+  ## initialize data frame
+  severity.df <- data.frame(x = numeric(0), 
+                            y = numeric(0), 
+                            HS = numeric(0), 
+                            fire_name <- character(0),
+                            alarm_date <- integer(0),
+                            cont_date <- integer(0),
+                            year = numeric(0), 
+                            objectid = numeric(0), 
+                            other_distance = numeric(0), 
+                            public_distance = numeric(0), 
+                            private_distance = numeric(0), 
+                            elevation = numeric(0), 
+                            aspect = numeric(0), 
+                            slope = numeric(0), 
+                            tpi = numeric(0)) 
+  
+  class(severity.df$alarm_date) <- "Date"
+  class(severity.df$cont_date) <- "Date"
+  ## iterate over years
+  for (i in 1:length(years)) {
+    
+    y <- years[i]
+  
+    f <- filelist[grepl(paste(fire.data[fire.data$year == y, "objectid"], collapse = "|"), filelist)]
+    fire_names <- fire.data[fire.data$year == y, "fire_name"]
+    
+    ## loop over fires 
+    for (fire in 1:length(f)) {
+      
+      severity <- raster(paste0(fp_orig, "so_cbi/", f[fire]))
+      
+      ## reproject mcf layer
+      mcsub <- projectRaster(mixedcon, severity)
+      
+      ## process severity layer
+      severity <- overlay(severity, mcsub, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      
+      severity <- reclassify(severity, rcl = rc_matrix)
+      
+      n.severity.df <- as.data.frame(severity, xy = TRUE, na.rm = TRUE)
+      colnames(n.severity.df)[3] <- "HS"
+      
+      n.severity.df$fire_name <- fire.data[fire.data$year == y, "fire_name"][fire]
+      n.severity.df$year <- y
+      n.severity.df$objectid <- fire.data[fire.data$year == y, "objectid"][fire]
+      
+      
+      ## process ownership distance data:
+      ext <- extent(severity)
+      empty.raster <- raster(ext, res = res(severity))
+      ownership.raster <- fasterize(ownership.shp, empty.raster, field = "Group_ID")
+      ownership_private.raster <- fasterize(ownership_private.shp, empty.raster, field = "Group_ID")
+      ownership_merged.raster <- merge(ownership.raster, ownership_private.raster)
+      ownership_merged.raster[is.na(ownership_merged.raster)] <- 0
+      
+      ## calculate distance to ownership types
+      ownership_other.raster <- ownership_merged.raster
+      ownership_other.raster[ownership_other.raster != 0] <- NA
+      
+      ## if no other ownership, assign large distance in order to eliminate from model
+      if(any(!is.na(ownership_other.raster[]))) {
+        
+        other_distance.raster <- distance(ownership_other.raster)
+        other_distance.raster <- overlay(other_distance.raster, severity, fun = function(x, y) {
+          x[is.na(y[])] <- NA
+          return(x)
+        })
+        other_distance.df <- as.data.frame(other_distance.raster, xy = FALSE, na.rm = TRUE)
+        n.severity.df$other_distance <- other_distance.df$layer ## merge into dataframe
+        
+      }
+      else {
+        n.severity.df$other_distance <- 1e+15
+      }
+      
+      
+      ownership_public.raster <- ownership_merged.raster
+      ownership_public.raster[ownership_public.raster != 2] <- NA
+      
+
+      ownership_public.raster[!is.na(ownership_public.raster)] <- 0
+      public_distance.raster <- distance(ownership_public.raster)
+      public_distance.raster <- overlay(public_distance.raster, severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      public_distance.df <- as.data.frame(public_distance.raster, xy = FALSE, na.rm = TRUE)
+      n.severity.df$public_distance <- public_distance.df$layer ## merge into dataframe
+
+      
+ 
+      ownership_private.raster[!is.na(ownership_private.raster)] <- 0
+      private_distance.raster <- distance(ownership_private.raster)
+      private_distance.raster <- overlay(private_distance.raster, severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      private_distance.df <- as.data.frame(private_distance.raster, xy = FALSE, na.rm = TRUE)
+      n.severity.df$private_distance <- private_distance.df$layer ## merge into dataframe
+      
+      
+      ## TOPOGRAPHY processing
+      n.elevation <- projectRaster(DEM, severity)
+      n.elevation <- overlay(n.elevation, severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      n.elevation.df <- as.data.frame(n.elevation, xy = FALSE, na.rm = TRUE)
+      n.severity.df$elevation <- n.elevation.df$layer
+      
+      n.aspect <- projectRaster(aspect, severity)
+      n.aspect <- overlay(n.aspect, severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      n.aspect.df <- as.data.frame(n.aspect, xy = FALSE, na.rm = TRUE)
+      n.severity.df$aspect <- n.aspect.df$layer
+      
+      n.slope <- projectRaster(slope, severity)
+      n.slope <- overlay(n.slope, severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      n.slope.df <- as.data.frame(n.slope, xy = FALSE, na.rm = TRUE)
+      n.severity.df$slope <- n.slope.df$layer
+      
+      n.tpi <- projectRaster(TPI, severity)
+      n.tpi <- overlay(n.tpi, severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+      n.tpi.df <- as.data.frame(n.tpi, xy = FALSE, na.rm = TRUE)
+      n.severity.df$tpi <- n.tpi.df$layer
+      ## bind new data
+      severity.df <- rbind(severity.df, n.severity.df)
+      
+    }
+    
+  }  
+  
+  return(severity.df) ## return data frame
+  
+}
+
+## function to split vector for parallelization
+par_split <- function(x, cores) split(x, cut(seq_along(x), cores, labels = FALSE))
+
+years_tosample <- par_split(unique(as.numeric(as.character(fire.data$year))), detectCores())
+
+## run function (takes a long time and is memory intensive, needs to run on cluster)
+severity_list <- mclapply(years_tosample, process_severity, mc.cores = detectCores(), filelist = files, firelist = fire.data)
+
+full_data <- do.call(rbind, severity_list)
+
+## cleanup
+rm(severity_list)
+gc()
+
+```
+
+
+####1.4 Weather
+```{r}
+
+## pre-process weather data
+weather_grid <- raster(paste0(fp_int, "metdata_elevationdata.nc")) ## this is actually elevation data but at same grid as weather
+weather_grid <- crop(weather_grid, DEM)
+weather_grid.df <- as.data.frame(weather_grid, xy = TRUE, na.rm = TRUE)
+
+
+## determine nearest weather grid point for each data point in full_data
+neighbors <- nn2(weather_grid.df[,c("x", "y")], full_data[,c("x", "y")], k = 1)
+full_data$weatherlat <- weather_grid.df[,"y"][neighbors$nn.idx]
+full_data$weatherlong <- weather_grid.df[,"x"][neighbors$nn.idx]
+
+## create unique weather x fire identifier
+full_data$weather_ID <- paste0(full_data$objectid, "_", full_data$weatherlat, "_", full_data$weatherlong)
+
+## create new dataset to loop over
+weather_data <- data.frame(weather_ID = as.character(unique(full_data$weather_ID)))
+weather_data$weather_ID <- as.character(weather_data$weather_ID)
+weather_data$objectid <- as.numeric(unlist(strsplit(weather_data$weather_ID, "_")))[seq(1, nrow(weather_data)*3, by = 3)]
+weather_data$lat <- as.numeric(unlist(strsplit(weather_data$weather_ID, "_")))[seq(2, nrow(weather_data)*3, by = 3)]
+weather_data$long <- as.numeric(unlist(strsplit(weather_data$weather_ID, "_")))[seq(3, nrow(weather_data)*3, by = 3)]
+weather_data <- weather_data[complete.cases(weather_data),]
+weather_data$max_bi_7 <- NA
+weather_data$mean_bi_7 <- NA
+
+
+##set all end dates to +7
+fire.data$alarm_plus_7 <- fire.data$alarm_date+7
+fire.data$alarm_plus_10 <- fire.data$alarm_date+10
+
+##errors in year data:
+## ralston is from 2006 not 2007, confirmed by wikipedia
+fire.data[fire.data$fire_name == "RALSTON", "year"] <- 2006
+full_data[full_data$fire_name == "RALSTON", "year"] <- 2006
+
+weather_data <- weather_data[!is.na(weather_data$objectid),]
+
+## function to scrape weather data from web
+pull_weather <- function(hs_fire, vs = c("bi"), range = "alarm_plus_7") {
+  hs_fire <- as.data.frame(hs_fire)
+  #Get dates and convert to proper format using regex
+    sd=fire.data[fire.data$objectid == hs_fire$objectid,"alarm_date"]
+    ##sd=gsub('^(.{4})(.*)$', '\\1-\\2', sd) #Insert dash (crazy regex)
+    ##sd=gsub('^(.{7})(.*)$', '\\1-\\2', sd) #Insert dash
+    ed=paste(fire.data[fire.data$objectid == hs_fire$objectid, range]) #End burn window 7 days after ignition
+    ##ed=gsub('^(.{4})(.*)$', '\\1-\\2', ed) #Insert dash (crazy regex)
+    ##ed=gsub('^(.{7})(.*)$', '\\1-\\2', ed) #Insert dash
+    
+    if (grepl("7", range)) r <- "7"
+    else if (grepl("10", range)) r <- "10"
+    else if (grepl("14", range)) r <- "14"
+    
+    full_vs <- c("tmmx", "tmmn", "rmax", "bi")
+    fullname_vs <- 
+      c("air_temperature","air_temperature","relative_humidity","burning_index_g")
+    vs_full <- #API call needs full variable name as well
+      fullname_vs[full_vs %in% vs]
+    for(index in 1:length(vs)){ #Variable for loop
+      v=vs[index]
+      v_full=vs_full[index]
+      
+      #Key function: Create a string with the url for data download
+      #This string includes the specific area (lat/long) and time window of interest. 
+      #The area is specified by a bounding box,
+      #with a 0.2 degree buffer around the fire centroid.
+      #The resolution of the data is 0.04 degrees per pixel-width.
+      v_link=paste0("https://www.reacchpna.org/thredds/ncss/MET/", v, "/", v, "_", 
+                    fire.data[fire.data$objectid == hs_fire$objectid, "year"],
+                    ".nc?var=",v_full,
+                    "&north=",round(hs_fire$lat+0.2, 5),
+                    "&west=",round(hs_fire$long-0.2, 5),
+                    "&east=",round(hs_fire$long+0.2, 5),
+                    "&south=",round(hs_fire$lat-0.2, 5),
+                    "&disableProjSubset=on&horizStride=1",
+                    "&time_start=",sd,"T00%3A00%3A00Z",
+                    "&time_end=",ed,"T00%3A00%3A00Z&timeStride=1&accept=netcdf")
+      
+      dest <-  paste0("REMOTE/DATA/",v,".nc" )
+      #Optional: Add lat/long centroid to data frame to check accuracy.
+      #fire.list[f,"lat"]=gCentroid(hs_fire_ll)$y
+      #fire.list[f,"long"]=gCentroid(hs_fire_ll)$x
+      tmp <- #Download the relevant nc file from GridMet for the appropriate point and time
+        try(download.file(url=v_link,destfile=dest, mode="wb"), silent=T)
+      if(class(tmp)!="try-error"){ #CHECK download error: 
+        #if the download produced an error (e.g. fires 251, 252), 
+        #you will have to do it manually so skip the next bit.
+        #otherwise, extract climate maxima/minima from the downloaded file.
+        ncin <- nc_open(filename = dest) #Open the file you just downloaded
+        lat <- ncvar_get(ncin,"lat",verbose=F) #Several pixels in sample
+        lat_target <- #Find closest latitude pixel to fire centroid
+          which.min(abs(lat - hs_fire$lat)) 
+        lon <- ncvar_get(ncin,"lon",verbose=F)
+        lon_target <- #Find closest latitude to fire centroid
+          which.min(abs(lon - hs_fire$long)) 
+        v_array <- ncvar_get(ncin,v_full)
+        if(class(v_array)=="matrix"){ 
+          #If there was only one burn day, so there's a matrix instead of an array
+          #Duplicate the arrayso there's no error produced in maximum calculation
+          v_array=replicate(2,v_array,simplify="array")
+        }
+        if(v=="tmmx"){
+          #Get maximum high temperature during the burn window
+        hs_fire[1,paste0("max_", v, "_", r)] <- #Convert from K to C
+            max(v_array[lat_target,lon_target,])-273.15 
+        }
+        if(v=="tmmn"){
+          #Get maximum low temperature during the burn window
+          hs_fire[1,paste0("max_", v, "_", r)] <- #Convert from K to C
+            max(v_array[lat_target,lon_target,])-273.15
+        }
+        #Get minimum high RH during the burn window
+        if(v=="rmax"){
+          hs_fire[1,paste0("min_", v, "_", r)] <-
+            min(v_array[lat_target,lon_target,]) 
+        }
+        if(v=="bi"){
+          #Get max burn index during burn window
+          hs_fire[1,paste0("max_", v, "_", r)] <-
+            max(v_array[lat_target,lon_target,]) 
+          hs_fire[1,paste0("mean_", v, "_", r)] <-
+            mean(v_array[lat_target,lon_target,])
+        }
+      } #END CHECK download error
+    closeAllConnections() 
+    unlink(dest) 
+    }
+  return(hs_fire)
+}
+
+n.cores <- detectCores()
+for(f in seq(1, nrow(weather_data), by = n.cores)) { #Fire for loop
+  
+  indices <- seq(f, (f+n.cores-1))
+  hs_fires <- split(weather_data[indices, ], seq(n.cores)) ## create list of rows
+  
+  weather.input <- tryCatch(mclapply(hs_fires, FUN = pull_weather, mc.cores = n.cores), warning =function(w) w, error = function(e) e)
+  
+  ## dont mess everything up if there is a warning
+  if(!inherits(weather.input, "warning") & !inherits(weather.input, "error")) {
+    
+    weather_data[indices, ] <- as.data.frame(do.call(rbind, weather.input))
+    write.csv(weather_data,"REMOTE/DATA/weather_data_NewAnalysis.csv")
+
+    gc()
+    print(paste0(indices[n.cores], " complete"))
+    
+  }
+  
+}
+
+## sometimes the connection fails, retry these instances
+misses <- as.numeric(rownames(weather_data[is.na(weather_data$max_bi_7), ]))
+
+for(f in misses) { #Fire for loop
+  
+  indices <- misses[i:(i+n.cores-1)]
+  indices <- indices[!is.na(indices)]
+  hs_fires <- split(weather_data[indices, ], seq(length(indices))) ## create list of rows
+  
+  weather.input <- tryCatch(mclapply(hs_fires, FUN = pull_weather, mc.cores = n.cores), warning =function(w) w, error = function(e) e)
+  
+  ## dont mess everything up if there is a warning
+  if(!inherits(weather.input, "warning") & !inherits(weather.input, "error")) {
+    
+    weather_data[indices, ] <- as.data.frame(do.call(rbind, weather.input))
+    write.csv(centroids,"REMOTE/DATA/weather_data_NewAnalysis.csv")
+
+    gc()
+    print(paste0(indices[n.cores], " complete"))
+    
+  }
+  
+  i <- i+n.cores
+}
+
+## check if fully downloaded
+length(as.numeric(rownames(centroids[is.na(weather_data$max_bi), ]))) == 0 ##g2g
+
+## join weather data to full_data
+full_data <- merge(full_data, weather_data[, c("weather_ID", "max_bi_10", "mean_bi_10","max_bi_7", "mean_bi_7")], by = "weather_ID", all = TRUE)
+full_data <- full_data[complete.cases(full_data),]
+
+```
+
+
+####1.5 Calculate topographic indices and add ecoregions
+```{r}
+## remove unneeded columns
+full_data <- full_data[, !(names(full_data) %in% c("weather_ID", "weatherlat", "weatherlong", "X"))]
+
+## calculate heat load:
+full_data$folded_aspect <- 180 - abs(full_data$aspect - 180)
+full_data$folded_aspect <- (full_data$folded_aspect*pi)/180 ## convert to radians
+full_data$rad.lat <- (full_data$y*pi)/180 ## convert to radians
+full_data$rad.slope <- (full_data$slope*pi)/180 ## convert to radians
+full_data$heat_load <- -1.467 + (1.582*cos(full_data$rad.lat)*cos(full_data$rad.slope)) + (-1.5*cos(full_data$folded_aspect)*sin(full_data$rad.slope)*sin(full_data$rad.lat)) + (-.262*sin(full_data$rad.lat)*sin(full_data$rad.slope)) + (.607*sin(full_data$folded_aspect)*sin(full_data$rad.slope))
+
+full_data$heat_load <- exp(full_data$heat_load)
+
+## remove unneeded columns
+full_data <- full_data[, !(names(full_data) %in% c("rad.lat", "rad.slope", "folded_aspect"))]
+
+
+
+## load ecoregions data
+ecoregions <- st_read("REMOTE/DATA/ca_eco_l3.shp")
+ecoregions <- st_transform(ecoregions, crs(raster(paste0(fp_orig, "so_cbi/", files[1]))))
+
+## add ecoregions data to full_data
+ext <- extent(weather_grid)
+empty.raster <- raster(ext, res = res(weather_grid))
+ecoregions.raster <- fasterize(ecoregions, empty.raster, field = "US_L3CODE")
+ecoregions.df <- as.data.frame(ecoregions.raster, xy = TRUE, na.rm = TRUE)
+
+neighbors <- nn2(ecoregions.df[,c("x", "y")], full_data[,c("x", "y")], k = 1)
+full_data$ecoregion <- ecoregions.df[,"layer"][neighbors$nn.idx]
+
+full_data$ecoregion <- factor(full_data$ecoregion)
+
+```
+
+
+####1.5 Cleaning
+```{r}
+
+## reclass factors as factors
+full_data$year <- as.factor(full_data$year)
+
+## create ownership column for cleaning purposes
+full_data$ownership <- NA
+full_data[full_data$other_distance == 0, "ownership"] <- "other"
+full_data[full_data$public_distance == 0, "ownership"] <- "public"
+full_data[full_data$private_distance == 0, "ownership"] <- "private"
+
+## subset data to ensure comparability between ownerships
+full_data <- full_data[full_data$elevation < max(full_data[full_data$ownership == "private", "elevation"]), ]
+full_data <- full_data[full_data$elevation > min(full_data[full_data$ownership == "private", "elevation"]), ]
+full_data <- full_data[full_data$slope < max(full_data[full_data$ownership == "private", "slope"]), ]
+full_data <- full_data[full_data$tpi < max(full_data[full_data$ownership == "private", "tpi"]), ]
+full_data <- full_data[full_data$tpi > min(full_data[full_data$ownership == "private", "tpi"]), ]
+
+
+## normalize data values
+full_data$slope.norm <- (full_data$slope - mean(full_data$slope))/sd(full_data$slope)
+full_data$elevation.norm <- (full_data$elevation - mean(full_data$elevation))/sd(full_data$elevation)
+full_data$heat_load.norm <- (full_data$heat_load - mean(full_data$heat_load))/sd(full_data$heat_load)
+full_data$tpi.norm <- (full_data$tpi - mean(full_data$tpi))/sd(full_data$tpi)
+full_data$max_bi.norm <- (full_data$max_bi - mean(full_data$max_bi))/sd(full_data$max_bi)
+full_data$mean_bi.norm <- (full_data$mean_bi - mean(full_data$mean_bi))/sd(full_data$mean_bi)
+full_data$max_bi_7.norm <- (full_data$max_bi_7 - mean(full_data$max_bi_7))/sd(full_data$max_bi_7)
+full_data$mean_bi_7.norm <- (full_data$mean_bi_7 - mean(full_data$mean_bi_7))/sd(full_data$mean_bi_7)
+write.csv(full_data, "REMOTE/DATA/full_data.csv")
+```
+
+
+
+
+******************************* MODEL FITTING ********************************
+
+
+##2 Model Fitting
+
+####2.1 Preparation and naive model run
+```{r}
+
+full_data <- fread("REMOTE/DATA/full_data.csv")
+
+## take a stratified random sample of 25% from each fire to make computation feasible
+bootstrap_data <- as.data.frame(stratified(indt = full_data, group = "objectid", size = (0.25)))
+
+## function to calculate values of 1 for a range of interest and tolerance
+calc_q <- function(range, val = 0.001) -log(val)/range
+
+## calculate qs of interest
+ranges <- as.matrix(seq(0, 8, 0.5))
+qs <- apply(X = ranges, MARGIN = 1, FUN = calc_q)
+
+## function to attenuate distances for full column
+att <- function(dist, q) exp(-q*dist)
+att_distance <- function(dists, q) apply(X = as.matrix(dists), MARGIN = 1, FUN = att, q = q)
+
+## function to caluclate weighted average proximity
+avg_dist <- function(dist.prime, dist1, dist2) dist.prime * (dist.prime/(sum(c(dist.prime, dist1, dist2))))
+
+## function to fit model and extract likelihood for a value of q
+check_q <- function(data, q) {
+  
+  data$other_dist_att <- exp(-q*(data$other_distance/1000))
+  data$public_dist_att <- exp(-q*(data$public_distance)/1000)
+  data$private_dist_att <- exp(-q*(data$private_distance)/1000)
+  
+  data[data$other_dist_att == 1, "other_dist_att"] <- 0
+  data[data$public_dist_att == 1, "public_dist_att"] <- 0
+  data[data$private_dist_att == 1, "private_dist_att"] <- 0
+  
+  avg_other <- mapply(FUN = avg_dist, dist.prime = data[,"other_dist_att"], dist1 = data[,"public_dist_att"], dist2 = data[,"private_dist_att"], SIMPLIFY = TRUE)
+  avg_public <- mapply(FUN = avg_dist, dist.prime = data[,"public_dist_att"], dist1 = data[,"other_dist_att"], dist2 = data[,"private_dist_att"], SIMPLIFY = TRUE)
+  avg_private <- mapply(FUN = avg_dist, dist.prime = data[,"private_dist_att"], dist1 = data[,"other_dist_att"], dist2 = data[,"public_dist_att"], SIMPLIFY = TRUE)
+  
+  data$avg_other <- avg_other
+  data$avg_public <- avg_public
+  data$avg_private <- avg_private
+  
+  print("running model")
+
+  model <- speedglm(HS ~ ownership + avg_other + avg_public + avg_private + slope.norm + elevation.norm + heat_load.norm + tpi.norm + ecoregion + objectid, data = data, family = binomial(), model = FALSE, y = FALSE)
+  
+  print("finished model run")
+  
+  logLik <- logLik(model)
+  
+  return(list(q, logLik))
+  
+}
+
+
+test.models <- vector("list", length(qs))
+for (i in 1:length(qs)) {
+  
+  print(paste("starting model:"), i)
+  
+  test.models[[i]] <- check_q(q = qs[i], data = bootstrap_data)
+  
+  print(paste("finished model:"), i)
+  
+  
+}
+
+
+df.distance_test <- data.frame(q = sapply(test.models, "[[", 1), logLik = sapply(test.models, "[[", 2))
+
+## model with best fitting q value based on max dist of 6km
+q <- df.distance_test[df.distance_test$logLik == max(df.distance_test$logLik), "q"]
+
+## do calculations and add to data.frame
+bootstrap_data$other_dist_att <- exp(-q*(bootstrap_data$other_distance/1000))
+bootstrap_data$public_dist_att <- exp(-q*(bootstrap_data$public_distance)/1000)
+bootstrap_data$private_dist_att <- exp(-q*(bootstrap_data$private_distance)/1000)
+  
+bootstrap_data[bootstrap_data$other_dist_att == 1, "other_dist_att"] <- 0
+bootstrap_data[bootstrap_data$public_dist_att == 1, "public_dist_att"] <- 0
+bootstrap_data[bootstrap_data$private_dist_att == 1, "private_dist_att"] <- 0
+  
+avg_other <- mapply(FUN = avg_dist, dist.prime = bootstrap_data[,"other_dist_att"], dist1 = bootstrap_data[,"public_dist_att"], dist2 = bootstrap_data[,"private_dist_att"], SIMPLIFY = TRUE)
+avg_public <- mapply(FUN = avg_dist, dist.prime = bootstrap_data[,"public_dist_att"], dist1 = bootstrap_data[,"other_dist_att"], dist2 = bootstrap_data[,"private_dist_att"], SIMPLIFY = TRUE)
+avg_private <- mapply(FUN = avg_dist, dist.prime = bootstrap_data[,"private_dist_att"], dist1 = bootstrap_data[,"other_dist_att"], dist2 = bootstrap_data[,"public_dist_att"], SIMPLIFY = TRUE)
+  
+bootstrap_data$avg_other <- avg_other
+bootstrap_data$avg_public <- avg_public
+bootstrap_data$avg_private <- avg_private
+  
+bootstrap_data$objectid <- as.factor(bootstrap_data$objectid)
+bootstrap_data$ecoregion <- as.factor(bootstrap_data$ecoregion)
+
+fwrite(bootstrap_data, "REMOTE/BOOTSTRAP/bootstrap_data.csv")
+
+## run naive_glm on full data to get base parameter estimates
+naive_glm <- glm(HS ~ ownership + avg_other + avg_public + avg_private + slope.norm + elevation.norm + heat_load.norm + tpi.norm + ecoregion + objectid, data = bootstrap_data, family = binomial)
+
+
+## now we estimate the scale of residual autocorrelation by vitting a semivariogram
+## transform to UTM zone 10 in meters bc easier to work with
+sp_bs <- st_as_sf(bootstrap_data, coords = c("x", "y"), crs = crs(DEM))
+sp_bs <- st_transform(sp_bs, crs = 32610)
+
+bootstrap_data <- data.frame(bootstrap_data)
+bootstrap_data[,c("x", "y")] <- st_coordinates(sp_bs)
+## create variogram to estimate maximum range of autocorrelation
+resid.rm.glm <- residuals(naive_glm)
+df.resid <- data.frame(z = resid.rm.glm, x = bootstrap_data$x, y = bootstrap_data$y)
+v1 <- variogram(z~1, data = df.resid, locations = ~x+y, cutoff = 3000)
+f1 <- fit.variogram(v1, vgm("Sph"))
+max.dist <- f1$range[2]
+bb <- ceiling(max.dist) ##round up to nearest whole number
+
+
+bootstrap_data <- bootstrap_data[sample(nrow(bootstrap_data)),]
+```
+
+
+####2.2 Spatial block bootstrapping
+``` {r}
+## Define study area and determine number of bounding boxes. There is a bit of weirdness because of overlapping fire boundaries.
+## create vector of objectids
+bootstrap_data <- fread("REMOTE/BOOTSTRAP/bootstrap_data.csv")
+bootstrap_data <- data.table(bootstrap_data)
+
+## get list of objectids to stratify over
+objectids <- unique(bootstrap_data$objectid)
+
+## create empty dataframe for potential sample points
+sample_points <- data.frame(objectid = objectids, 
+                            xmin = rep(0, times = length(objectids)), 
+                            xmax = rep(0, times = length(objectids)), 
+                            ymin = rep(0, times = length(objectids)), 
+                            ymax = rep(0, times = length(objectids)),
+                            num_boxes = rep(0, times = length(objectids)))
+
+## loop over individual fires:
+for (i in 1:length(objectids)) {
+  
+  ## determine minimum rectangle
+  fire_area <- list(xmin = min(bootstrap_data[objectid == as.numeric(as.character(objectids[i])), "x"]),
+                    xmax = max(bootstrap_data[objectid == as.numeric(as.character(objectids[i])), "x"]),
+                    ymin = min(bootstrap_data[objectid == as.numeric(as.character(objectids[i])), "y"]),
+                    ymax = max(bootstrap_data[objectid == as.numeric(as.character(objectids[i])), "y"]))
+   
+  ## divide study area into boxes of size bb
+  box_centers <- expand.grid(x = seq(fire_area$xmin, fire_area$xmax, by = bb) + bb/2,
+                             y = seq(fire_area$ymin, fire_area$ymax, by = bb) + bb/2)
+  
+  
+  num_boxes <- nrow(box_centers)
+  
+  sample_points[i, 2] <- min(box_centers$x)
+  sample_points[i, 3] <- max(box_centers$x)
+  sample_points[i, 4] <- min(box_centers$y)
+  sample_points[i, 5] <- max(box_centers$y)
+  sample_points[i, 6] <- num_boxes
+
+}
+
+## req fields for analysis:
+fields <- c("HS", 
+            "ownership",
+            "avg_other",
+            "avg_public", 
+            "avg_private",
+            "slope.norm", 
+            "elevation.norm", 
+            "heat_load.norm", 
+            "tpi.norm", 
+            "ecoregion", 
+            "year", 
+            "objectid")
+
+
+## function to pull data given spatial extent, fire name, and fields
+pull_data <- function(xcoord, ycoord, data, bb, objid) {
+  
+  p.data <- data[objectid == as.numeric(as.character(objid))]
+  
+  p.data <- p.data[x > (xcoord-(bb/2)) & x < (xcoord+(bb/2)) & y > (ycoord-(bb/2)) & y < (ycoord+(bb/2))]
+  
+  return(p.data)
+  
+}
+
+
+## function to randomly choose boxes and pull data:
+rpull <- function(nbox, objectid, data, bb, sample_points) {
+  
+  xcoords <- runif(nbox, sample_points[sample_points$objectid == objectid, "xmin"], sample_points[sample_points$objectid == objectid, "xmax"])
+  ycoords <- runif(nbox, sample_points[sample_points$objectid == objectid, "ymin"], sample_points[sample_points$objectid == objectid, "ymax"])
+  
+  bs.data <- mapply(xcoords, 
+                ycoords, 
+                FUN = pull_data, 
+                MoreArgs = list(data = data, bb = bb, objid = objectid),
+                SIMPLIFY = FALSE)
+  
+  out <- do.call(rbind, bs.data)
+  
+  return(out)
+  
+}
+
+## set number of bootstraps 
+n <- 300
+
+## create empty dataframe of fitted coefficients:
+cols <- rownames(coef(summary(naive_glm)))
+bs.coefs <- data.frame(matrix(NA, nrow = 1, ncol = length(cols)))
+colnames(bs.coefs) <- cols
+bs.coefs <- bs.coefs[0,] ## janky janky I'm a bad programmer
+
+## write function to create bootstrap dataset, run model, append estimates to dataframe
+run_bootstrap <- function(iter) {
+  
+  bs.data <- as.data.frame(do.call(rbind, mcmapply(objectid = sample_points$objectid, 
+                                               nbox = sample_points$num_boxes, 
+                                               FUN = rpull, 
+                                               SIMPLIFY = FALSE,
+                                               MoreArgs = list(data = bootstrap_data,
+                                                               bb = bb,
+                                                               sample_points = sample_points),
+                                               mc.cores = detectCores())))
+  
+  print("starting glm")
+  
+  bs.glmm <- speedglm(HS ~ ownership + avg_other + avg_public + avg_private + slope.norm + elevation.norm + heat_load.norm + tpi.norm + ecoregion + objectid, 
+                      data = bs.data, 
+                      family = binomial(),
+                      y = FALSE,
+                      model = FALSE,
+                      fitted = FALSE)
+  
+  coefs <- as.data.frame(matrix(coef(summary(bs.glmm))[, "Estimate"],
+                                nrow = 1))
+  rm(bs.glmm)
+  gc()
+  
+  colnames(coefs) <- cols
+  
+  return(coefs)
+  
+}
+
+## run bootstraps, can be done in parallel but my poor computer could not handle it
+## a note - when doing this with speedglm I had memory clearing issues. gc() did not remove all the memory, and so in order to fully clear the memory between runs I had to restart R. I did so by looping on an alternative script which included calls to restart R after each iteration. (See below)
+for(i in 1:(round(n/1))) {
+  
+  if (i == 1) print("starting bootstrap")
+  
+  coef.list <- mclapply(1, run_bootstrap, mc.cores = 1)
+  n.coefs <- as.data.frame(do.call(rbind, coef.list))
+  bs.coefs <- rbind(bs.coefs, n.coefs)
+  
+  write.csv(bs.coefs, file = "REMOTE/BOOTSTRAP/bootstrap_coefs_newerdata.csv")
+  
+  gc()
+  
+  print(paste0("completed iteration: ", i*7))
+  
+  print(Sys.time())
+}
+
+
+## this is the janky way to force R to restart after each iteration
+## first save workspace image
+save.image(file = "bsd.Rdata")
+## then run external file (contents below)
+source("run_bootstrap.R")
+
+```
+
+Here are the contents of the external file "run_bootstrap.R"
+
+```{R}
+
+library(rstudioapi)
+library(parallel)
+library(data.table)
+library(speedglm)
+
+load("bsd.Rdata")
+bs.coefs <- read.csv("REMOTE/BOOTSTRAP/bootstrap_coefs_newerdata.csv")
+
+print("starting bootstrap")
+set.seed(NULL)
+coef.list <- run_bootstrap(1)
+print(coef.list)
+colnames(bs.coefs) <- colnames(coef.list)
+bs.coefs <- rbind(bs.coefs, coef.list)
+write.csv(bs.coefs, file = "REMOTE/BOOTSTRAP/bootstrap_coefs_newerdata.csv", row.names = FALSE)
+
+gc()
+
+print(paste0("completed iteration: ", nrow(bs.coefs)))
+
+print(Sys.time())
+
+if (nrow(bs.coefs) < 300) {
+  
+  restartSession(command='source("run_bootstrap.R")')
+  
+}
+
+
+```
+
+
+####2.3 post-hoc weather analysis
+```{r}
+## weather data analysis
+
+## get random effects estimates for objectids
+## colnames:
+rfnames <- c("objectid113", names(bs.coefs[16:168]))
+
+## get corresponding objectids and years
+## rfobj <- sapply(strsplit(rfnames, ":"), "[[", 2)
+## rfyear <- sapply(strsplit(rfnames, ":"), "[[", 1)
+
+## get average rf estimates
+rfobj.est<- c(0, colMeans(bs.coefs[,16:168]))
+
+## create data.frame
+rf.df <- data.frame(objectid = rfnames, estimate = rfobj.est)
+
+
+## get average burn index
+max_bi <- aggregate(max_bi ~ objectid, data = bootstrap_data, FUN = mean)
+
+rf.df$max_bi <- max_bi$max_bi
+
+rf.df$S <- sapply(bs.coefs[,c(1, 16:168)], sd)
+
+bimod <- mixmeta(estimate ~ max_bi, random = ~1|objectid, S = rf.df$S, data = rf.df)
+bimod.sum <- summary(bimod)
+## nada
+
+## generate plot:
+ggplot(data = rf.df, aes(x = max_bi, y = estimate)) +
+  geom_point() +
+  geom_abline(intercept = coef(bimod.sum)["(Intercept)", "Estimate"],
+              slope = coef(bimod.sum)["max_bi", "Estimate"],
+              linetype = "dashed",
+              alpha = 0.5) + 
+  ylab("Fire Effect (log odds)") +
+  xlab("Maximum Burn Index") +
+  theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+```
+
+
+
+
+
+## fire summary stats
+```{r}
+
+full_data <- fread("REMOTE/DATA/full_data.csv")
+full_data <- data.frame(full_data)
+
+calc_sstats <- function(objectid) {
+  
+  check.data <- full_data[full_data$objectid == objectid, ]
+  
+  tot <- nrow(check.data)
+  private <- nrow(check.data[check.data$ownership == "private",])
+  public <- nrow(check.data[check.data$ownership == "public",])
+  other <- nrow(check.data[check.data$ownership == "other",])
+  
+  ha <- tot* (900/10000)
+  
+  year <- check.data$year[1]
+  fire_name <- check.data$fire_name[1]
+  
+  out <- data.frame(objectid = objectid, year = year, fire_name = fire_name, private = private/tot, public = public/tot, other = other/tot, ha = ha)
+  
+  return(out)
+  
+}
+
+stats <- calc_sstats("113")
+
+objectids <- as.character(unique(full_data$objectid))
+
+for (i in 2:length(objectids)) {
+  
+  n.stats <- calc_sstats(objectids[i])
+  
+  stats <- rbind(stats, n.stats)
+  
+}
+
+
+
+
+
+
+```
+
+
+
+
+## visualizations
+
+
+```{r}
+
+set.seed(257314) ## number of acres in the rim fire - for replicability
+
+```
+
+
+##### Generate maps
+```{r}
+key <- "AIzaSyDbqWY8bqIQlO-zFHN407RIXqo4Xm-EQaE"
+
+pers <- st_read("REMOTE/SevOwnership-main/Data/Intermediate/study_pers.shp")
+
+pers$year <- as.numeric(as.character(pers$year))
+
+states <- st_as_sf(map("state", plot = FALSE, fill = TRUE))
+
+CA <- states[4,]
+pers <- st_transform(pers, st_crs(CA))
+
+cities <- data.frame(state = rep("California", times = 5),
+                     city = c("San Fransisco", "Oakland", "Sacramento", "Redding", "Eureka"))
+cities$lat <- c(37.773972,37.8043637,38.575764,40.5865396,40.8020712)
+cities$lon <- c(-122.431297,-122.2711137,-121.478851,-122.3916754,-124.1636729)
+
+(cities <- st_as_sf(cities, coords = c("lon", "lat"), remove = FALSE,
+    crs = st_crs(CA), agr = "constant"))
+
+
+ggplot(data = pers) +
+  geom_sf( size = 0.1, color = "black") +
+  coord_sf(ylim = c(37.5, 42), xlim = c(-124.5, -119)) +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+ecoregions.sub <- ecoregions[c(2, 4, 5, 6, 8, 13 ),]
+
+ggplot(data = ecoregions.sub, aes(fill = US_L3NAME)) +
+  geom_sf() +
+  scale_fill_manual()
+
+
+states <- st_as_sf(map("state", plot = FALSE, fill = TRUE))
+CA <- states[4,]
+
+cities <- data.frame(state = rep("California", times = 5),
+                     city = c("San Fransisco", "Oakland", "Sacramento", "Redding", "Eureka"))
+cities$lat <- c(37.773972,37.8043637,38.575764,40.5865396,40.8020712)
+cities$lon <- c(-122.431297,-122.2711137,-121.478851,-122.3916754,-124.1636729)
+
+(cities <- st_as_sf(cities, coords = c("lon", "lat"), remove = FALSE,
+    crs = st_crs(CA), agr = "constant"))
+
+st_crs(ecoregions.sub)
+st_crs(pers)
+
+ecoregions.sub$US_L3NAME <- c("Basin and Range", "Cascades", "Sierra Nevada", "Foothills",  "Klamath","Eastern Cascades")
+
+ecoregions.sub$US_L3NAME <- factor(ecoregions.sub$US_L3NAME, levels = c("Basin and Range", "Sierra Nevada", "Cascades", "Foothills", "Eastern Cascades", "Klamath"))
+
+
+ggplot(data = ecoregions.sub) +
+  geom_sf(aes(fill = US_L3NAME), size = 0.1) +
+  geom_sf(data = pers, fill = "gray", color = "black", size= 0.1) +
+  ##geom_sf(data = CA, fill = "gray", alpha = 0.2) +
+  geom_sf(data = cities) +
+  geom_text_repel(data = cities, aes(x = lon, y = lat, label = city), size = 4,
+                  color = "black", fontface = "bold",
+                  nudge_x = c(1, -1.5, -0.5, 2, -5),
+                  nudge_y = c(0.25, -0.25, 0.25, 0.5, 0.25)) +
+  scale_fill_manual(values = c( "#a6cee3", "#1f78b4", "#b2df8a", "#33a02c", "#fb9a99", "#e31a1c" )) +
+  coord_sf(ylim = c(37.5, 42), xlim = c(-124.5, -119)) +
+  labs(fill = "Ecoregion") +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+test.severity <- raster(paste0(fp_orig, "so_cbi/", filelist[15]))
+test.severity <- reclassify(test.severity, rcl = rc_matrix)
+plot(test.severity)
+
+ext <- extent(test.severity)
+empty.raster <- raster(ext, res = res(severity))
+ownership.raster <- fasterize(ownership.shp, empty.raster, field = "Group_ID")
+ownership_private.raster <- fasterize(ownership_private.shp, empty.raster, field = "Group_ID")
+ownership_merged.raster <- merge(ownership.raster, ownership_private.raster)
+ownership_merged.raster[is.na(ownership_merged.raster)] <- 0
+
+mcsub <- projectRaster(mixedcon, test.severity)
+
+test.severity <- overlay(test.severity, mcsub, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+
+ownership_merged.raster <- overlay(ownership_merged.raster, test.severity, fun = function(x, y) {
+        x[is.na(y[])] <- NA
+        return(x)
+      })
+
+ownership_merged.shp <- rasterToPolygons(ownership_merged.raster, dissolve = TRUE)
+ownership_merged.shp <- st_as_sf(ownership_merged.shp)
+plot(ownership_merged.shp)
+
+test.severity.shp <- rasterToPolygons(test.severity, dissolve = TRUE)
+test.severity.shp <- st_as_sf(test.severity.shp)
+hs.shp <- test.severity.shp[test.severity.shp$layer == 0, ]
+hs.shp$layer <- as.factor(hs.shp$layer)
+plot(hs.shp)
+test.severity.shp$layer <- as.factor(test.severity.shp$layer)
+
+ownership_merged.shp$layer <- as.factor(ownership_merged.shp$layer)
+c("#e66101", "#5e3c99", "#2b83ba")
+ggplot(data = ownership_merged.shp) +
+  geom_sf(aes(fill = layer), alpha = 1, size = 0) +
+  scale_fill_manual(values = c("#FD8D3C", "#08306B","#238B45" )) +
+  geom_sf(data = hs.shp, fill = "lightgray", size = 0, alpha = 0.6) +
+  geom_sf(fill = NA, alpha = 1, size = 0) +
+  scalebar(data = ownership_merged.shp, location = "bottomleft", dist = 2, dist_unit = "km", transform = TRUE) +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+
+moonlightown <- as.data.frame(ownership_merged.raster, xy = TRUE)
+moonlightown$layer <- as.factor(moonlightown$layer)
+moonlightown <- moonlightown[!is.na(moonlightown$layer),]
+moonlightown <- rasterToPolygons(moonlightown, dissolve = TRUE)
+
+
+moonlightsev <- as.data.frame(test.severity, xy = TRUE)
+moonlightsev$layer <- as.factor(moonlightsev$layer)
+moonlightsev <- moonlightsev[!is.na(moonlightsev$layer) & moonlightsev$layer != 0,]
+
+ggplot(data = moonlightown) +
+  geom_raster(aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = moonlightsev, aes(x = x, y = y, fill = layer), alpha = 0.5)
+  
+
+empty.raster <- raster(ext, res = res(severity))
+pers$ind <- 1
+pers.raster <- fasterize(pers, empty.raster, field = "ind")
+
+ext <- extract(ownership.raster, pers.raster)
+
+```
+
+
+
+```{r}
+
+## maps
+
+err_prop <- function(vars) {
+  se <- sapply(bs.coefs[, vars], sd)
+  n.se <- sqrt(sum(se^2) + sum(2*cov(bs.coefs[,vars])[lower.tri(cov(bs.coefs[,vars]))]))
+  return(n.se)
+  
+}
+
+ilink <- function(x) exp(x)/(1+exp(x))
+
+
+## get model matrix
+proximity <- seq(0, 1, length.out = 1000)
+true.dist <-log(proximity)/(-q)
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, proximity = proximity, ownershippublic = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5",  "avg_private", "ownershippublic")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+private.upper <- ilink(y.pub.priv + (1.97*se))
+private.lower <- ilink(y.pub.priv - (1.97*se))
+private <- ilink(y.pub.priv)
+
+public.private.data <- data.frame(proximity = proximity, true.dist  = true.dist, ownership = "private", y = private, y.upper = private.upper, y.lower = private.lower)
+
+
+## get model matrix
+proximity <- seq(0, 1, length.out = 1000)
+true.dist <-log(proximity)/(-q)
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, proximity = proximity, ownershippublic = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5",  "avg_other", "ownershippublic")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+private.upper <- ilink(y.pub.other + (1.97*se))
+private.lower <- ilink(y.pub.other - (1.97*se))
+private <- ilink(y.pub.other)
+
+public.other.data <- data.frame(proximity = proximity, true.dist  = true.dist, ownership = "other", y = private, y.upper = private.upper, y.lower = private.lower)
+
+
+pub.data <- rbind(public.private.data, public.other.data)
+
+pub.distplot <- ggplot(data = pub.data, aes(x = true.dist, y = y)) +
+  geom_line(aes(color = ownership), size = 1.5) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper, fill = ownership), alpha = 0.2) +
+  scale_x_reverse(expand = c(0,0), limits = c(6, 0)) +
+  scale_y_continuous(limits = c(0.55, 0.8)) + 
+  ylab("Pr(High Severity)") +
+  xlab("Distance from Ownership Type (km)") +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c("#08306B", "#FD8D3C" )) +
+  scale_fill_manual(values = c("#238B45", "#238B45" )) +
+   theme(axis.line.y = element_line(size = 0.75, color = "black"),
+         axis.line.x = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        ##axis.text.y = element_blank(),
+        ##axis.title.y = element_blank(),
+        ##axis.line.y = element_blank(),
+        legend.position = "none",
+        axis.ticks.y = element_line(size = 0.25, color = "black"),
+        plot.title = element_text(size = 16))
+
+
+
+## get model matrix
+proximity <- seq(0, 1, length.out = 1000)
+true.dist <-log(proximity)/(-q)
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, proximity = proximity, ownershipother = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5",  "avg_public", "ownershipother")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+private.upper <- ilink(y.other.pub + (1.97*se))
+private.lower <- ilink(y.other.pub - (1.97*se))
+private <- ilink(y.other.pub)
+
+other.public.data <- data.frame(proximity = proximity, true.dist  = true.dist, ownership = "public", y = private, y.upper = private.upper, y.lower = private.lower)
+
+
+## get model matrix
+proximity <- seq(0, 1, length.out = 1000)
+true.dist <-log(proximity)/(-q)
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, proximity = proximity, ownershipother = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5",  "avg_other", "ownershipother")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+private.upper <- ilink(y.other.priv + (1.97*se))
+private.lower <- ilink(y.other.priv - (1.97*se))
+private <- ilink(y.other.priv)
+
+other.private.data <- data.frame(proximity = proximity, true.dist  = true.dist, ownership = "private", y = private, y.upper = private.upper, y.lower = private.lower)
+
+
+other.data <- rbind(other.public.data, other.private.data)
+
+other.distplot <- ggplot(data = other.data, aes(x = true.dist, y = y)) +
+  geom_line(aes(color = ownership), size = 1.5) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper, fill = ownership), alpha = 0.2) +
+  scale_x_reverse(expand = c(0,0), limits = c(6, 0)) +
+  scale_y_continuous(limits = c(0.55, 0.8)) + 
+  ylab("Pr(High Severity)") +
+  xlab("Distance from Ownership Type (km)") +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c( "#238B45", "#08306B" )) +
+  scale_fill_manual(values = c( "#FD8D3C", "#FD8D3C" )) +
+   theme(axis.line.y = element_line(size = 0.25, color = "black"),
+         axis.line.x = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_blank(),
+        ##axis.line.y = element_blank(),
+        legend.position = "none",
+        axis.ticks.y = element_line(size = 0.25, color = "black"),
+        plot.title = element_text(size = 16))
+
+## get model matrix
+proximity <- seq(0, 1, length.out = 1000)
+true.dist <-log(proximity)/(-q)
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, proximity = proximity))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5",  "avg_public")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+private.upper <- ilink(y.priv.pub + (1.97*se))
+private.lower <- ilink(y.priv.pub - (1.97*se))
+private <- ilink(y.priv.pub)
+
+private.public.data <- data.frame(proximity = proximity, true.dist  = true.dist, ownership = "public", y = private, y.upper = private.upper, y.lower = private.lower)
+
+
+## get model matrix
+proximity <- seq(0, 1, length.out = 1000)
+true.dist <-log(proximity)/(-q)
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, proximity = proximity))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5",  "avg_other")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+private.upper <- ilink(y.priv.other + (1.97*se))
+private.lower <- ilink(y.priv.other - (1.97*se))
+private <- ilink(y.priv.other)
+
+private.other.data <- data.frame(proximity = proximity, true.dist  = true.dist, ownership = "other", y = private, y.upper = private.upper, y.lower = private.lower)
+
+
+priv.data <- rbind(private.public.data, private.other.data)
+
+priv.distplot <- ggplot(data = priv.data, aes(x = true.dist, y = y)) +
+  geom_line(aes(color = ownership), size = 1.5) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper, fill = ownership), alpha = 0.2) +
+  scale_x_reverse(expand = c(0,0), limits = c(6, 0)) +
+  scale_y_continuous(limits = c(0.55, 0.8)) + 
+  ylab("Pr(High Severity)") +
+  xlab("Distance from Ownership Type (km)") +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c( "#238B45", "#FD8D3C" )) +
+  scale_fill_manual(values = c( "#08306B", "#08306B" )) +
+   theme(axis.line.y = element_line(size = 0.25, color = "black"),
+         axis.line.x = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        ##axis.line.y = element_blank(),
+        legend.position = "none",
+        axis.ticks.y = element_line(size = 0.25, color = "black"),
+        plot.title = element_text(size = 16))
+
+aligned <- align_plots(pub.distplot, priv.distplot, other.distplot, align = "h")
+
+dist_grid <- plot_grid(aligned[[1]], aligned[[2]], aligned[[3]], nrow = 1, labels = c("Public", "Private", "Other"))
+
+
+
+
+fires <- c("Moonlight", "Rim", "Carr", "Camp", "King")
+bigids <- c(113, 17730, 20788, 17812, 20730)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+priv.upper <- ilink(y.priv.other[1] + (1.97*se))
+priv.lower <- ilink(y.priv.other[1] - (1.97*se))
+priv <- ilink(y.priv.other[1])
+
+priv.d <- data.frame( ownership = "private", y = priv, y.upper = priv.upper, y.lower = priv.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershippublic = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+pub.upper <- ilink(y.pub.other[1] + (1.97*se))
+pub.lower <- ilink(y.pub.other[1] - (1.97*se))
+pub <- ilink(y.pub.other[1])
+
+pub.d <- data.frame( ownership = "public", y = pub, y.upper = pub.upper, y.lower = pub.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershipother = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershipother")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+other.upper <- ilink(y.other.pub[1] + (1.97*se))
+other.lower <- ilink(y.other.pub[1] - (1.97*se))
+other <- ilink(y.pub.other[1])
+
+other.d <- data.frame(ownership = "other", y = other, y.upper = other.upper, y.lower = other.lower)
+
+int.data <- rbind(priv.d, pub.d, other.d)
+
+
+ownplotMoonlight <- ggplot(data = int.data, aes(x = ownership, y = y, color = ownership)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = y.lower, ymax = y.upper), 
+                width = 0.4, size = 1) +
+  ylab("Pr(High Severity)") +
+  scale_y_continuous(limits = c(0.2, 0.8)) + 
+  scale_color_manual(values = c("#08306B",  "#238B45", "#FD8D3C" )) +
+  theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size = 16),
+        legend.position = "none")
+
+ownplotMoonlight
+
+
+objectid <- "objectid17730"
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.priv.other[1]+effect.Rim
+
+priv.upper <- ilink(val + (1.97*se))
+priv.lower <- ilink(val - (1.97*se))
+priv <- ilink(val)
+
+priv.d <- data.frame(ownership = "private", y = priv, y.upper = priv.upper, y.lower = priv.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershippublic = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.pub.other[1]+effect.Rim
+
+pub.upper <- ilink(val + (1.97*se))
+pub.lower <- ilink(val- (1.97*se))
+pub <- ilink(val)
+
+pub.d <- data.frame( ownership = "public", y = pub, y.upper = pub.upper, y.lower = pub.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershipother = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershipother", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.other.priv[1]+effect.Rim
+
+other.upper <- ilink(val + (1.97*se))
+other.lower <- ilink(val - (1.97*se))
+other <- ilink(val)
+
+other.d <- data.frame(ownership = "other", y = other, y.upper = other.upper, y.lower = other.lower)
+
+int.data <- rbind(priv.d, pub.d, other.d)
+
+
+ownplotRim <- ggplot(data = int.data, aes(x = ownership, y = y, color = ownership)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = y.lower, ymax = y.upper), 
+                width = 0.4, size = 1) +
+  ylab("Pr(High Severity)") +
+  scale_y_continuous(limits = c(0.2, 0.8)) + 
+  scale_color_manual(values = c("#08306B",  "#238B45", "#FD8D3C" )) +
+  theme(axis.line.x = element_line(size = 0.75, color = "black"),
+        axis.line.y = element_line(size = 0.25, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size = 16),
+        legend.position = "none")
+
+ownplotRim
+
+
+objectid <- "objectid20788"
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.priv.other[1]+effect.Carr
+
+priv.upper <- ilink(val + (1.97*se))
+priv.lower <- ilink(val - (1.97*se))
+priv <- ilink(val)
+
+priv.d <- data.frame(ownership = "private", y = priv, y.upper = priv.upper, y.lower = priv.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershippublic = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.pub.other[1]+effect.Carr
+
+pub.upper <- ilink(val + (1.97*se))
+pub.lower <- ilink(val- (1.97*se))
+pub <- ilink(val)
+
+pub.d <- data.frame( ownership = "public", y = pub, y.upper = pub.upper, y.lower = pub.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershipother = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershipother", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.other.priv[1]+effect.Carr
+
+other.upper <- ilink(val + (1.97*se))
+other.lower <- ilink(val - (1.97*se))
+other <- ilink(val)
+
+other.d <- data.frame(ownership = "other", y = other, y.upper = other.upper, y.lower = other.lower)
+
+int.data <- rbind(priv.d, pub.d, other.d)
+
+
+ownplotCarr<- ggplot(data = int.data, aes(x = ownership, y = y, color = ownership)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = y.lower, ymax = y.upper), 
+                width = 0.4, size = 1) +
+  ylab("Pr(High Severity)") +
+  scale_y_continuous(limits = c(0.2, 0.8)) + 
+  scale_color_manual(values = c("#08306B",  "#238B45", "#FD8D3C" )) +
+  theme(axis.line.x = element_line(size = 0.75, color = "black"),
+        axis.line.y = element_line(size = 0.25, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size = 16),
+        legend.position = "none")
+
+ownplotCarr
+
+
+
+
+objectid <- "objectid17812"
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.priv.other[1]+effect.King
+
+priv.upper <- ilink(val + (1.97*se))
+priv.lower <- ilink(val - (1.97*se))
+priv <- ilink(val)
+
+priv.d <- data.frame(ownership = "private", y = priv, y.upper = priv.upper, y.lower = priv.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershippublic = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.pub.other[1]+effect.King
+
+pub.upper <- ilink(val + (1.97*se))
+pub.lower <- ilink(val- (1.97*se))
+pub <- ilink(val)
+
+pub.d <- data.frame( ownership = "public", y = pub, y.upper = pub.upper, y.lower = pub.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershipother = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershipother", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.other.priv[1]+effect.King
+
+other.upper <- ilink(val + (1.97*se))
+other.lower <- ilink(val - (1.97*se))
+other <- ilink(val)
+
+other.d <- data.frame(ownership = "other", y = other, y.upper = other.upper, y.lower = other.lower)
+
+int.data <- rbind(priv.d, pub.d, other.d)
+
+
+ownplotKing <- ggplot(data = int.data, aes(x = ownership, y = y, color = ownership)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = y.lower, ymax = y.upper), 
+                width = 0.4, size = 1) +
+  ylab("Pr(High Severity)") +
+  scale_y_continuous(limits = c(0.2, 0.8)) + 
+  scale_color_manual(values = c("#08306B",  "#238B45", "#FD8D3C" )) +
+  theme(axis.line.x = element_line(size = 0.75, color = "black"),
+        axis.line.y = element_line(size = 0.25, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size = 16),
+        legend.position = "none")
+
+ownplotKing
+
+
+objectid <- "objectid20730"
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.priv.other[1]+effect.Camp
+
+priv.upper <- ilink(val + (1.97*se))
+priv.lower <- ilink(val - (1.97*se))
+priv <- ilink(val)
+
+priv.d <- data.frame(ownership = "private", y = priv, y.upper = priv.upper, y.lower = priv.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershippublic = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.pub.other[1]+effect.Camp
+
+pub.upper <- ilink(val + (1.97*se))
+pub.lower <- ilink(val- (1.97*se))
+pub <- ilink(val)
+
+pub.d <- data.frame( ownership = "public", y = pub, y.upper = pub.upper, y.lower = pub.lower)
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, ownershipother = 1, objectid = 1))
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershipother", objectid)]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+val <- y.other.priv[1]+effect.Camp
+
+other.upper <- ilink(val + (1.97*se))
+other.lower <- ilink(val - (1.97*se))
+other <- ilink(val)
+
+other.d <- data.frame(ownership = "other", y = other, y.upper = other.upper, y.lower = other.lower)
+
+int.data <- rbind(priv.d, pub.d, other.d)
+
+
+ownplotCamp<- ggplot(data = int.data, aes(x = ownership, y = y, color = ownership)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = y.lower, ymax = y.upper), 
+                width = 0.4, size = 1) +
+  ylab("Pr(High Severity)") +
+  scale_y_continuous(limits = c(0.2, 0.8)) + 
+  scale_color_manual(values = c("#08306B",  "#238B45", "#FD8D3C" )) +
+  theme(axis.line.x = element_line(size = 0.75, color = "black"),
+        axis.line.y = element_line(size = 0.25, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(size = 16),
+        legend.position = "none")
+
+ownplotCamp
+
+own_grid <- plot_grid(ownplotMoonlight, ownplotCarr, ownplotKing, ownplotRim, ownplotCamp, nrow = 1, labels = c("Moonlight", "Rim", "Carr", "King", "Camp"))
+
+out <- plot_grid(dist_grid, own_grid, nrow = 2, labels = c("(a)", "(b)"))
+ggsave(out, "out.pdf")
+
+
+
+## For ecoregions
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion4 = c(0, 1, 0, 0, 0, 0), ecoregion5 = c(0, 0, 1, 0, 0, 0), ecoregion6 = c(0, 0, 0, 1, 0, 0), ecoregion8 = c(0, 0, 0, 0, 1, 0), ecoregion13 = c(0, 0, 0, 0, 0, 1), dum_ownpublic = 1))
+
+pred <- model.matrix %*% c(Int, effect.Cascades, effect.Sierra, effect.Foothills, effect.Klamath, effect.ECascades, effect.Public)
+
+
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion4", "ecoregion5", "ecoregion6", "ecoregion8", "ecoregion13", "ownershippublic")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+y.upper <- ilink(pred + (1.97*se))
+y.lower <- ilink(pred - (1.97*se))
+y <- ilink(pred)
+
+ecoregion.data <- data.frame(Ecoregion = c("Basin and Range", "Cascades", "Sierra Nevada", "Foothills", "Klamath", "Eastern Cascades"), y = y, y.upper = y.upper, y.lower = y.lower)
+
+ecoregion.data$Ecoregion <- factor(ecoregion.data$Ecoregion, levels = c("Basin and Range", "Sierra Nevada", "Cascades", "Foothills", "Eastern Cascades", "Klamath"))
+
+ecoplot <- ggplot(data = ecoregion.data, aes(x = Ecoregion, y = y)) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = y.lower, ymax = y.upper), 
+                width = 0.2, size = 0.75) +
+  ylab("Pr(High Severity)") +
+  ##scale_y_continuous(limits = c(0.31, 0.46)) + 
+  ##scale_color_manual(values = c( "#a6cee3", "#1f78b4", "#b2df8a", "#33a02c", "#fb9a99", "#e31a1c" )) +
+  theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(size = 16),
+        legend.position = "none")
+
+ecoplot
+
+## for TPI
+
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, dum_ownpublic = 1, tpi.norm = seq(min(bootstrap_data$tpi.norm), max(bootstrap_data$tpi.norm), length.out = 500)))
+
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", "tpi.norm")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+
+effect.tpinorm <- coef(summary(naive_glm))["tpi.norm","Estimate"]
+
+n.Int <- Int + (min(bootstrap_data$tpi.norm)*effect.tpinorm)
+pred <- n.Int + effect.Public + effect.Sierra + (seq(min(bootstrap_data$tpi.norm), max(bootstrap_data$tpi.norm), length.out = 500)*effect.tpinorm) 
+
+upper <- ilink(pred + (1.97*se))
+lower <- ilink(pred - (1.97*se))
+pred.p <- ilink(pred)
+
+tpi.data <- data.frame(tpi = seq(min(bootstrap_data$tpi), max(bootstrap_data$tpi), length.out = 500), y = pred.p, y.upper = upper, y.lower = lower)
+
+tpi_plot <- ggplot(data = tpi.data, aes(x = tpi, y = y)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper), alpha = 0.2) +
+  scale_x_continuous(expand = c(0,0)) +
+  ylab("Pr(High Severity)") +
+  xlab("Topographic Position Index (m)") +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+  scale_fill_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+   theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+## for heat_load
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, dum_ownpublic = 1, heat_load.norm = seq(min(bootstrap_data$heat_load.norm), max(bootstrap_data$heat_load.norm), length.out = 500)))
+
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", "heat_load.norm")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+
+effect.heat_loadnorm <- coef(summary(naive_glm))["heat_load.norm","Estimate"]
+
+n.Int <- Int + (min(bootstrap_data$heat_load.norm)*effect.heat_loadnorm)
+pred <- n.Int + effect.Public + effect.Sierra + (seq(min(bootstrap_data$heat_load.norm), max(bootstrap_data$heat_load.norm), length.out = 500)*effect.heat_loadnorm) 
+
+upper <- ilink(pred + (1.97*se))
+lower <- ilink(pred - (1.97*se))
+pred.p <- ilink(pred)
+
+heat_load.data <- data.frame(heat_load = seq(min(bootstrap_data$heat_load), max(bootstrap_data$heat_load), length.out = 500), y = pred.p, y.upper = upper, y.lower = lower)
+
+heat_load_plot <- ggplot(data = heat_load.data, aes(x = heat_load, y = y)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper), alpha = 0.2) +
+  scale_x_continuous(expand = c(0,0)) +
+  ylab("Pr(High Severity)") +
+  xlab(bquote(~Heat ~Load ~(MJ ~cm^-1 ~year^-1 ))) +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+  scale_fill_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+   theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+## for elevation
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, dum_ownpublic = 1, elevation.norm = seq(min(bootstrap_data$elevation.norm), max(bootstrap_data$elevation.norm), length.out = 500)))
+
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", "elevation.norm")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+
+effect.elevationnorm <- coef(summary(naive_glm))["elevation.norm","Estimate"]
+
+n.Int <- Int + (min(bootstrap_data$elevation.norm)*effect.elevationnorm)
+pred <- n.Int + effect.Public + effect.Sierra + (seq(min(bootstrap_data$elevation.norm), max(bootstrap_data$elevation.norm), length.out = 500)*effect.elevationnorm) 
+
+upper <- ilink(pred + (1.97*se))
+lower <- ilink(pred - (1.97*se))
+pred.p <- ilink(pred)
+
+elevation.data <- data.frame(elevation = seq(min(bootstrap_data$elevation), max(bootstrap_data$elevation), length.out = 500), y = pred.p, y.upper = upper, y.lower = lower)
+
+elevation_plot <- ggplot(data = elevation.data, aes(x = elevation, y = y)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper), alpha = 0.2) +
+  scale_x_continuous(expand = c(0,0)) +
+  ylab("Pr(High Severity)") +
+  xlab("Elevation (m)") +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+  scale_fill_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+   theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+
+
+## For slope
+model.matrix <- as.matrix(data.frame(`(Intercept)` = 1, ecoregion5 = 1, dum_ownpublic = 1, slope.norm = seq(min(bootstrap_data$slope.norm), max(bootstrap_data$slope.norm), length.out = 500)))
+
+predvar <- diag(model.matrix %*% cov(bs.coefs[, c("(Intercept)", "ecoregion5", "ownershippublic", "slope.norm")]) %*% t(model.matrix))
+se <- sqrt(predvar)
+
+
+effect.slopenorm <- coef(summary(naive_glm))["slope.norm","Estimate"]
+
+n.Int <- Int + (min(bootstrap_data$slope.norm)*effect.slopenorm)
+pred <- n.Int + effect.Public + effect.Sierra + (seq(min(bootstrap_data$slope.norm), max(bootstrap_data$slope.norm), length.out = 500)*effect.slopenorm) 
+
+upper <- ilink(pred + (1.97*se))
+lower <- ilink(pred - (1.97*se))
+pred.p <- ilink(pred)
+
+slope.data <- data.frame(slope = seq(min(bootstrap_data$slope), max(bootstrap_data$slope), length.out = 500), y = pred.p, y.upper = upper, y.lower = lower)
+
+slope_plot <- ggplot(data = slope.data, aes(x = slope, y = y)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = y.lower, ymax = y.upper), alpha = 0.2) +
+  scale_x_continuous(expand = c(0,0)) +
+  ylab("Pr(High Severity)") +
+  xlab("Slope (%)") +
+  labs(color = "Ownership Type", fill = "Ownership Type") +
+  scale_color_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+  scale_fill_manual(values = c( "#7570b3", "#1f78b4",  "#1b9e77")) +
+   theme(axis.line = element_line(size = 0.75, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+
+tpi_plot <- tpi_plot + 
+  scale_y_continuous(limits = c(0, 0.8)) 
+  
+slope_plot <- slope_plot + 
+  scale_y_continuous(limits = c(0.5, 0.8)) +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank()) 
+heat_load_plot <- heat_load_plot + scale_y_continuous(limits = c(0.5, 0.8))
+elevation_plot <- elevation_plot + 
+  scale_y_continuous(limits = c(0.5, 0.8)) +
+  theme(axis.title.y = element_blank())
+
+
+
+algn <- align_plots(tpi_plot, slope_plot, heat_load_plot, elevation_plot, align = "h")
+p1 <- plot_grid(algn[[1]], algn[[2]], algn[[3]], algn[[4]], nrow = 2)
+plot_grid(p1, ecoplot, nrow = 2, rel_heights = c(2, 1))
+
+
+
+
+
+trial_glm <- naive_glm
+n.vcov <- cov(bs.coefs[,1:15])
+
+ilink <- family(naive_glm)$linkinv
+
+bigids <- c(17730, 20788, 17812, 20730)
+## create fake data
+proximity <- seq(0, 1, length.out = 1000)
+
+se.privdist <- err_prop(c("(Intercept)", "ecoregion5", "avg_private"))
+se.pubdist <- err_prop(c("(Intercept)", "ecoregion5", "avg_public"))
+se.otherdist <- err_prop(c("(Intercept)", "ecoregion5", "avg_other"))
+
+effect.privdist <- coef(summary(naive_glm))["avg_private","Estimate"]
+effect.pubdist <- coef(summary(naive_glm))["avg_public","Estimate"]
+effect.otherdist <- coef(summary(naive_glm))["avg_other","Estimate"]
+Int <- coef(summary(naive_glm))["(Intercept)","Estimate"]
+effect.Sierra <- coef(summary(naive_glm))["ecoregion5","Estimate"]
+effect.Cascades <- coef(summary(naive_glm))["ecoregion4", "Estimate"]
+effect.Foothills <- coef(summary(naive_glm))["ecoregion6", "Estimate"]
+effect.Klamath <- coef(summary(naive_glm))["ecoregion8", "Estimate"]
+effect.ECascades <- coef(summary(naive_glm))["ecoregion13", "Estimate"]
+effect.Public <- coef(summary(naive_glm))["ownershippublic","Estimate"]
+effect.Other <- coef(summary(naive_glm))["ownershipother","Estimate"]
+effect.Rim <- coef(summary(naive_glm))["objectid17730", "Estimate"]
+effect.Carr <- coef(summary(naive_glm))["objectid20788", "Estimate"]
+effect.King <- coef(summary(naive_glm))["objectid17812", "Estimate"]
+effect.Camp <- coef(summary(naive_glm))["objectid20730", "Estimate"]
+
+y.priv.pub <- Int + effect.Sierra + (effect.pubdist * proximity)
+y.priv.other <- Int + effect.Sierra + (effect.otherdist * proximity)
+y.pub.priv <- Int + effect.Sierra + effect.Public + (effect.privdist * proximity)
+y.pub.other <- Int + effect.Sierra + effect.Public + (effect.otherdist * proximity)
+y.other.priv <- Int + effect.Sierra + effect.Other + (effect.privdist * proximity)
+y.other.pub <- Int + effect.Sierra + effect.Other + (effect.pubdist * proximity)
+
+y.priv.p <- ilink(y.priv)
+y.pub.p <- ilink(y.pub)
+y.other.p <- ilink(y.other)
+
+y.priv.upr <- ilink(y.priv + (1.97*se.privdist))
+y.priv.lower <- ilink(y.priv - (1.97*se.privdist))
+y.pub.upr <- ilink(y.pub + (1.97*se.pubdist))
+y.pub.lower <- ilink(y.pub - (1.97*se.pubdist))
+y.other.upr <- ilink(y.other + (1.97*se.otherdist))
+y.other.lower <- ilink(y.other - (1.97*se.otherdist))
+
+
+p.df <- data.frame(dist = dist, 
+                   private = y.priv.p, 
+                   public = y.pub.p, 
+                   other = y.other.p,
+                   private.upper = y.priv.upr,
+                   private.lower = y.priv.lower,
+                   public.upper = y.pub.upr,
+                   public.lower = y.pub.lower,
+                   other.upper = y.other.upr,
+                   other.lower = y.other.lower)
+
+ggplot(data = p.df, aes(x = dist, y = private)) +
+  geom_line(color = "#8da0cb", size = 1) +
+  geom_line(aes(y = public), color = "#66c2a5", size = 1) +
+  geom_line(aes(y = other), color = "#fc8d62", size = 1) +
+  geom_ribbon(aes(ymin = private.lower, ymax = private.upper), fill = "#8da0cb", alpha = 0.2) +
+  geom_ribbon(aes(ymin = public.lower, ymax = public.upper), fill = "#66c2a5", alpha = 0.2) +
+  geom_ribbon(aes(ymin = other.lower, ymax = other.upper), fill = "#fc8d62", alpha = 0.2) +
+  scale_x_continuous(expand = c(0,0)) +
+  ylab("Pr(High Severity)") +
+  xlab("Distance from Ownership Type (km)") +
+   theme(axis.line = element_line(size = 0.5, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 16))
+
+
+
+
+
+
+
+
+## group means
+Sierra_Private <- mean(bs.coefs[,1]) + mean(bs.coefs[,"ecoregion5"])
+Sierra_Public <- mean(bs.coefs[,1]) + mean(bs.coefs[,"ecoregion5"]) + mean(bs.coefs[,"dum_ownpublic"])
+Sierra_Other <- mean(bs.coefs[,1]) + mean(bs.coefs[,"ecoregion5"]) + mean(bs.coefs[,"dum_ownother"])
+
+exp(Sierra_Private)/(1+exp(Sierra_Private))
+exp(Sierra_Public)/(1+exp(Sierra_Public))
+exp(Sierra_Other)/(1+exp(Sierra_Other))
+
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+`
+```{r}
+sampleset <- c("private", "public", "other")
+
+bootstrap_data$dum_own <- as.factor(sample(sampleset, nrow(bootstrap_data), replace = TRUE)) ## generate random list of dummy variables for ownership assignment
+bootstrap_data$ownership <- as.factor(bootstrap_data$ownership)
+
+## create empty column for dist-to-ownership type
+bootstrap_data$dist <- 0
+    
+bootstrap_data[bootstrap_data$dum_own == "other", "dist"] <- bootstrap_data[bootstrap_data$dum_own == "other", "other_distance"]
+bootstrap_data[bootstrap_data$dum_own == "private", "dist"] <- bootstrap_data[bootstrap_data$dum_own == "private", "private_distance"]
+bootstrap_data[bootstrap_data$dum_own == "public", "dist"] <- bootstrap_data[bootstrap_data$dum_own == "public", "public_distance"]
+    
+
+bootstrap_data$dum_own <- factor(bootstrap_data$dum_own, c("private", "public", "other"))
+bootstrap_data$ownership <- factor(bootstrap_data$ownership, c("private", "public", "other"))
+
+## if distance is greater than 3 km, treat it as a distance 0 of correct ownership type   
+bootstrap_data[bootstrap_data$dist > 3000, "dum_own"] <- bootstrap_data[bootstrap_data$dist > 3000, "ownership"]
+bootstrap_data[bootstrap_data$dist > 3000, "dist"] <- 0
+
+
+```
+
+
+
+### OLD SHIT
+
+####1.1 Fire List
+
+```{r}
+
+## create dataframe of all fire names and the years in which they burned
+## "Value" refers to a dummy variable that will be used to merge names dataframe to other dataframes a bit later
+Value <- c(1, 1, 1, 1, 2, 1, seq(1:16), seq(1:3), 1, seq(1:4), seq(1:4), seq(1:4), 1, 1, 2, seq(1:4))
+## years in which fires occurred
+Year <- c(2000, 2001, 2002, rep(2006, 2), 2007, rep(2008, 16), rep(2009, 3), 2010, rep(2012, 4), rep(2013, 4), rep(2014, 4), 2015, 2016, 2016, rep(2017, 4))
+## fire names in chronological order by YEAR
+FIRE_NAMES <- c("STORRIE", "STAR", "CONE", "RALSTON", "Boulder Cmplx", "Moonlight", "chipps", "Bear", "Cold", "Cub", "Fall", "Fox, Four Mile", "Friend Darnell", "Government, Westville", "Little", "Onion2", "PEAVINE", "Scotch, South Frey", "Scotchman", "Venture", "Corral", "Pit", "Knight", "SUGARLOAF", "Tennant", "BULLARDS", "CHIPS", "BAGLEY", "READING", "Barry Point", "PANTHER", "American", "RIDGE/HEIGHTS", "RIM", "DAY", "EILER", "KING", "LITTLE DEER", "LOWELL", "TRAILHEAD", "WILLARD", "MINERVA 5", "PONDEROSA", "TABLE", "STEELE")
+NAMES.df <- data.frame(Value, Year, FIRE_NAMES) ## compile data frame
+
+```
+
+
+
+```{r}
+
+## write a function to extract severity data, fire name data and patch ID data for a single year
+sev_calc <- function(YEARS) {
+  sevs <- list() ## create empty list object to fill
+  for (i in YEARS[1]:YEARS[length(YEARS)]) { ## iterate over YEARS
+    
+    ## this part of loop loads in relevant data
+    filepath <- paste0("REMOTE/DATA/EXTRACTED_SEVERITY/ext_", i, ".tif") ## severity data
+    severity <- raster(filepath)
+    filepath1 <- paste0("REMOTE/DATA/NAMES/names_", i) ## fire name data
+    names <- raster(filepath1)
+    filepath2 <- paste0("REMOTE/DATA/PATCHES/patch_id_", i, ".tif") ## patch ID data
+    pi <- raster(filepath2)
+    
+    ## this part of loop manipulates data to usable format
+    m.severity <- rasterToPoints(severity) ## convert to point form
+    df.severity <- as.data.frame(m.severity, xy = TRUE, na.rm = TRUE) ## convert to data frame, drop NAs
+    m.names <- rasterToPoints(names) ## convert to point form
+    df.names <- as.data.frame(m.names, xy = TRUE, na.rm = TRUE) ## convert to data frame, drop NAs
+    m.pi <- rasterToPoints(pi) ## convert to point form
+    df.pi <- as.data.frame(m.pi, xy = TRUE, na.rm = TRUE) ## convert to data frame, drop NAs
+    df <- merge(df.severity, df.names, by = c("x", "y"), all = FALSE) ## merge names and severity data frames
+    df <- merge(df, df.pi, by = c("x", "y"), all = FALSE) ## merge in patch ID data frame
+    
+    ## this part of loop assigns correct fire name values
+    df$FIRE_NAMES <- NA ## create empty FIRE_NAME column (current names are numeric, this is where NAMES.df from 1.1 comes into play)
+    for (j in 1:length(unique(df.names[,paste0("names_", i)]))) { 
+      df[df[,paste0("names_", i)] == j, "FIRE_NAMES"] <- as.character(NAMES.df[NAMES.df$Value == j & NAMES.df$Year == i, "FIRE_NAMES"])
+    }
+    
+    ## this part of the loop cleans up dataframe
+    df <- df[, -4]
+    
+    colnames(df)[3] <- "HS" 
+    colnames(df)[4] <- "PATCH_ID"
+
+    df$YEAR <- rep(i, nrow(df))
+    df$PATCH_ID <- df$PATCH_ID + (i-2000)*10000 ## to create unique numeric values for each patch ID
+    
+    ## this part of loop appends current dataframe and notifies user
+    sevs <- c(sevs, list(df)) ## add current element to list
+    print(paste0("YEAR_", i, " completed.")) ## print completed message to check progress
+    gc() ## clear out unused memory space
+  }
+  return(sevs)
+}
+
+## iterate over cores to reduce processing time
+numcores <- detectCores() ## check number of cores
+yearslist <- list(c(2000,2001), c(2002, 2006), c(2007, 2008), c(2009,2010), c(2012,2013), c(2014,2015), 2016, 2017)
+
+## apply to cores, check time
+system.time(
+  severity.l <- mclapply(yearslist, sev_calc, mc.cores = numcores)
+)
+
+## extract severity dataframes from list (must be better way to do this)
+for (i in 1:length(yearslist)) {
+  for (j in 1:length(yearslist[[i]])) {
+    name <- paste0("severity_", yearslist[[i]][j])
+    assign(name, as.data.frame(severity.l[[i]][j]))
+  }
+}
+
+## computer is having problems with 2002 & 2006 for some reason. Do this independently for now.
+severity_2002 <- as.data.frame(sev_calc(2002))
+severity_2006 <- as.data.frame(sev_calc(2006))
+
+## bind severity data to single dataframe
+severity <- rbind(severity_2000, severity_2001, severity_2002, severity_2006, severity_2007, severity_2008, severity_2009, severity_2010,  severity_2012, severity_2013, severity_2014, severity_2015, severity_2016, severity_2017)
+
+rm(severity_2000, severity_2001, severity_2002, severity_2006, severity_2007, severity_2008, severity_2009, severity_2010,  severity_2012, severity_2013, severity_2014, severity_2015, severity_2016, severity_2017)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+## subset by fire
+
+colddata <- sub.bin_data[sub.bin_data$VB_ID == "COLD_2008", ]
+
+  if (length(unique(colddata$ownership)) < 3) {
+    sampleset <- ownership.mapping[ownership.mapping$ownership %in% unique(colddata$ownership),"dum_own"] 
+  } else  {
+    sampleset <- 1:3
+  }
+
+unique(colddata$dum_own)
+
+colddata$dum_own <- sample(sampleset, nrow(colddata), replace = TRUE)
+colddata$dum_own <- as.factor(colddata$dum_own)
+colddata$dist <- rep(0, times = nrow(colddata))
+
+
+for (i in 1:nrow(colddata)) {
+  if (colddata$dum_own[i] == "1") {
+    colddata$dist[i] <- colddata$other_dist[i]
+  }
+  else if (colddata$dum_own[i] == "2") {
+    colddata$dist[i] <- colddata$priv_dist[i]
+  }
+  else {
+    colddata$dist[i] <- colddata$pub_dist[i]
+  }
+}
+
+colddata <- colddata[colddata$dist < 1000,]
+colddata$dist <- colddata$dist/1000
+
+stratify <- function(data, n) {
+  
+  d1 <- data[data$dum_own == 1,]
+  d2 <- data[data$dum_own == 2,]
+  d3 <- data[data$dum_own == 3,]
+  
+  if ((nrow(d1) < n & nrow(d1) > 0) | (nrow(d2) < n & nrow(d2) > 0) | (nrow(d3) < n) & nrow(d3) > 0) {
+    nrows <- c(nrow(d1), nrow(d2), nrow(d3))
+    nrows <- nrows[nrows > 0]
+    n <- min(nrows)
+  }
+  
+  if(nrow(d1) >= n) {
+    s_d1 <- sample_n(d1, size = n)
+  }
+  else {
+    s_d1 <- d1
+  }
+  
+  if(nrow(d2) >= n) {
+    s_d2 <- sample_n(d2, size = n)
+  }
+  else {
+    s_d2 <- d2
+  }
+  
+  if(nrow(d3) >= n) {
+    s_d3 <- sample_n(d3, size = n)
+  }
+  else {
+    s_d3 <- d3
+  }
+  
+  return(rbind(s_d1, s_d2, s_d3))
+}
+
+
+s_colddata <- stratify(data = colddata, n = 2000)
+
+s_colddata$max_bi.norm <- (s_colddata$max_bi - mean(s_colddata$max_bi))/sd(s_colddata$max_bi)
+
+###### spBayes 
+
+## first fit glm model to get starting parameter values:
+rm.glm <- glm(HS ~ dum_own*dist + slope.norm + elevation.norm + heat_load.norm + TPI_fine.norm + max_bi.norm + CH.norm, data = s_colddata, family = "binomial")
+summary(rm.glm)
+beta.tuning <- t(chol(vcov(rm.glm)))
+resid.rm.glm <- as.vector(residuals(rm.glm))
+
+## plot variogram to determine max distance for autocorrelation parameters
+df.resid <- data.frame(z = resid.rm.glm, x = s_colddata$x, y = s_colddata$y)
+v1 <- variogram(z~1, data = df.resid, locations = ~x+y, cutoff = 5000)
+f1 <- fit.variogram(v1, vgm("Sph"))
+max.dist <- f1$range[2]*5
+
+## define parameters
+beta.starting <- coefficients(rm.glm) ## set starting values equal to glm estimates
+
+cov.glm <- vcov(rm.glm) 
+phi.lower <- -log(.05)/max.dist ## set phi lower to appropriate value for maximum distance in variog
+phi.mu <- -log(.05)/(.2*max.dist) ## set starting value of phi to modeled value
+phi.upper <- -log(.05)/1 ## set phi upper to 1m
+
+n.batch <- 400
+batch.length <- 50
+
+chainlist <- list(a = list(beta = rmvn(1, beta.starting, vcov(rm.glm)), phi = abs(rnorm(1, .0011, .0004)), ss = abs(rnorm(1, 7, 1))), b = list(beta = rmvn(1, beta.starting, vcov(rm.glm)), phi = abs(rnorm(1, .0011, .0004)), ss = abs(rnorm(1, 6, 1))))
+
+spGLM.fun <- function(inits) {
+  run <- spGLM(formula = HS ~ dum_own*dist + slope.norm + elevation.norm + heat_load.norm + TPI_fine.norm + max_bi.norm + CH.norm,
+                            data = s_beardata,
+                            family = "binomial",
+                            coords = as.matrix(cbind(s_beardata$x, s_beardata$y)),
+                            knots = c(15, 15, 0),
+                            tuning = list("beta" = c(1, .2, .21, 1.5, .13, 1.5, .12, .11, .12, .1, 2, 2, 2), "phi" = .5, "sigma.sq" = .5, "w" = .5),
+                            starting = list("beta" = inits$beta, "phi" = inits$phi, "sigma.sq" = inits$ss,"w" = 0),
+                            priors = list("beta.normal" = list(c(0,0,0,0,0,0,0,0,0,0,0, 0), c(100,100,100,100,100,100,100,100,100,100,100,100)), 
+                                          "phi.Unif" = c(1e-10, phi.upper), 
+                                          "sigma.sq.IG" = c(.001, .001)),
+                            cov.model = "exponential",
+                            amcmc=list("n.batch"=n.batch, "batch.length"=batch.length, "accept.rate"=.42),
+                            verbose = TRUE,
+                            n.report = 10)
+  return(run)
+}
+
+system.time ({
+  rmrun <- mclapply(chainlist, spGLM.fun, mc.cores = detectCores())
+})
+
+xx <- spGLM.fun(chainlist[[1]])
+
+n.samples <- n.batch*batch.length
+burn.in <- .2*n.samples
+sub.samps <- burn.in:n.samples
+
+chains <- mcmc.list(mcmc(rmrun[[1]]$p.beta.theta.samples[sub.samps,]), 
+                    mcmc(rmrun[[2]]$p.beta.theta.samples[sub.samps,]))
+
+chains <- mcmc(x$p.beta.theta.samples[sub.samps,])
+
+gelman.diag(chains)
+effectiveSize(chains)
+
+plot(chains)
+
+
+```
+
+
+
+
+####1.3 Ownership  
+
+```{r}
+
+
+## create raster for ownership type
+ext <- floor(extent(pers))
+ownership <- raster(ext, res = res(raster(paste0(fp_orig, "so_cbi/", files[1]))))
+ownership.shp <- st_collection_extract(ownership.shp, type = "POLYGON")
+ownership.raster <- fasterize(ownership.shp, ownership, field = "Group_ID")
+plot(ownership.raster)
+
+
+ownership_private.raster <- fasterize(ownership_private.shp, ownership, field = "Group_ID")
+plot(ownership_private.raster)
+
+ownership_merged.shp <- merge(ownership.raster, ownership_private.raster)
+plot(ownership_merged.shp)
+
+## convert unknown ownership to type "other"
+ownership_merged.shp[is.na(ownership_merged.shp)] <- 0
+plot(ownership_merged.shp)
+
+
+## create rasters for each ownership type in order to compute distance rasters
+ext <- extent(ownership_merged.shp)
+empty_raster <- raster(ext, res = res(raster(paste0(fp_orig, "so_cbi/", files[1]))))
+ownership_other.raster <- ownership_merged.shp
+ownership_other.raster[ownership_other.raster != 0] <- NA
+plot(ownership_other.raster)
+
+
+
+
+
+
+
+
+
+
+
+
+
+## input and clean ownership data
+ownership <- raster("REMOTE/DATA/OWNERSHIP/ownership.tif")
+NAvalue(ownership) <- 128
+df.ownership <- as.data.frame(ownership, xy = TRUE, na.rm = TRUE)
+colnames(df.ownership) <- c("ownership", "x", "y")
+bin_data <- merge(severity, df.ownership, by = c("x", "y"), all.x = TRUE)
+rm(df.ownership)
+rm(severity)
+bin_data$VB_ID <- toupper(paste0(bin_data$FIRE_NAMES, "_", bin_data$YEAR))
+
+unique(bin_data[bin_data$ownership == 0 & bin_data$VB_ID == "BOULDER CMPLX_2006", ])
+
+
+## OWNERSHIP PATCH_IDs
+own_patches <- raster("REMOTE/DATA/PATCHES/OWN_PATCHES.tif")
+df.own_patches <- as.data.frame(own_patches, xy = TRUE, na.rm = TRUE)
+colnames(df.own_patches) <- c("OWN_PATCHES", "x", "y")
+bin_data <- merge(bin_data, df.own_patches, by = c("x", "y"))
+rm(df.own_patches)
+```
+
+
+####1.4 Topography
+
+```{r}
+## load in elevation data:
+DEM <- raster("REMOTE/DATA/TOPOGRAPHY/DEM.tif")
+df.DEM <- as.data.frame(DEM, xy = TRUE, na.rm = TRUE)
+colnames(df.DEM) <- c("elevation","x", "y")
+bin_data <- merge(bin_data, df.DEM, by = c("x", "y"))
+
+## calculate slope data
+slope <- raster("REMOTE/DATA/TOPOGRAPHY/SLOPE2.tif")
+df.slope <- as.data.frame(slope, xy = TRUE, na.rm = TRUE)
+colnames(df.slope) <- c("slope", "x", "y")
+bin_data <- merge(bin_data, df.slope, by = c("x", "y"), all.x = TRUE)
+
+## load in aspect data:
+ASPECT <- raster("REMOTE/DATA/TOPOGRAPHY/Aspect.tif")
+df.ASPECT <- as.data.frame(ASPECT, xy = TRUE, na.rm = TRUE)
+colnames(df.ASPECT) <- c("aspect","x", "y")
+bin_data <- merge(bin_data, df.ASPECT, by = c("x", "y"))
+
+## get latitude data:
+ASPECT.pts <- rasterToPoints(ASPECT, spatial = TRUE)
+head(ASPECT.pts)
+geo.prj <- "+proj=longlat +datum=NAD83 +ellps=GRS80 +towgs84=0,0,0"
+ASPECT.pts <- spTransform(ASPECT.pts, CRS(geo.prj))
+proj4string(ASPECT.pts)
+ASPECT.pts@data <- data.frame(ASPECT.pts@data, long=coordinates(ASPECT.pts)[,1],
+                         lat=coordinates(ASPECT.pts)[,2]) 
+head(ASPECT.pts@data)
+longlat.df <- cbind(df.ASPECT[,c("x", "y")], ASPECT.pts@data)[, c("x", "y", "lat", "long")]
+
+bin_data <- merge(bin_data, longlat.df, by = c("x", "y"))
+
+## calculate heat load:
+bin_data$folded_aspect <- 180 - abs(bin_data$aspect - 180)
+bin_data$folded_aspect <- (bin_data$folded_aspect*pi)/180 ## convert to radians
+bin_data$rad.lat <- (bin_data$lat*pi)/180 ## convert to radians
+bin_data$rad.slope <- (bin_data$slope*pi)/180 ## convert to radians
+bin_data$heat_load <- -1.467 + (1.582*cos(bin_data$rad.lat)*cos(bin_data$rad.slope)) + (-1.5*cos(bin_data$folded_aspect)*sin(bin_data$rad.slope)*sin(bin_data$rad.lat)) + (-.262*sin(bin_data$rad.lat)*sin(bin_data$rad.slope)) + (.607*sin(bin_data$folded_aspect)*sin(bin_data$rad.slope))
+
+bin_data$heat_load <- exp(bin_data$heat_load)
+
+## load TPI data
+TPI_fine <- raster("REMOTE/DATA/TOPOGRAPHY/TPI_fine.tif")
+df.TPI_fine <- as.data.frame(TPI_fine, xy = TRUE, na.rm = TRUE)
+colnames(df.TPI_fine) <- c("TPI_fine", "x", "y")
+bin_data <- merge(bin_data, df.TPI_fine, by = c("x", "y"))
+
+TPI_course <- raster("REMOTE/DATA/TOPOGRAPHY/TPI_course.tif")
+df.TPI_course <- as.data.frame(TPI_course, xy = TRUE, na.rm = TRUE)
+colnames(df.TPI_course) <- c("TPI_course", "x", "y")
+bin_data <- merge(bin_data, df.TPI_course, by = c("x", "y"))
+
+```
+
+####1.5 Weather
+
+```{r}
+
+bin_data$OWNPATCH_ID <- paste0(bin_data$OWN_PATCHES, bin_data$VB_ID)
+## load weather data
+weather_data <- read.csv("REMOTE/DATA/weather_data1.csv")
+
+## rename weather data ID column
+names(weather_data)[names(weather_data) == "OWN_PATCHES"] <- "OWNPATCH_ID"
+
+## merge weather data and severity data
+bin_data <- merge(bin_data, weather_data, by = "OWNPATCH_ID", all.x = TRUE) 
+
+##fix column naming
+bin_data <- bin_data[, c(1:21, 26:29)]
+names(bin_data)[c(3, 14, 15)] <- c("VB_ID", "lat", "long")
+
+rm(weather_data)
+
+
+```
+
+
+#### 1.6 Calculate distance to nearest ownership
+```{r}
+
+priv_dist <- raster("~/block_storage/OWNDIST/PRIVdistance.tif")
+df.priv_dist <- as.data.frame(priv_dist, xy = TRUE, na.rm = TRUE)
+colnames(df.priv_dist) <- c("priv_dist", "x", "y")
+bin_data <- merge(bin_data, df.priv_dist, by = c("x", "y"), all.x = TRUE)
+rm(df.priv_dist)
+rm(priv_dist)
+
+pub_dist <- raster("~/block_storage/OWNDIST/PUBdistance.tif")
+df.pub_dist <- as.data.frame(pub_dist, xy = TRUE, na.rm = TRUE)
+colnames(df.pub_dist) <- c("pub_dist", "x", "y")
+bin_data <- merge(bin_data, df.pub_dist, by = c("x", "y"), all.x = TRUE)
+rm(df.pub_dist)
+rm(pub_dist)
+
+
+other_dist <- raster("~/block_storage/OWNDIST/OTHERdistance.tif")
+df.other_dist <- as.data.frame(other_dist, xy = TRUE, na.rm = TRUE)
+colnames(df.other_dist) <- c("other_dist", "x", "y")
+bin_data <- merge(bin_data, df.other_dist, by = c("x", "y"), all.x = TRUE)
+rm(df.other_dist)
+rm(other_dist)
+
+```
+
+
+
+```{r}
+
+## create vector of canopy height data years. No actual data for 2017, but denotes end year
+CH.yearslist <- c(2001, 2008, 2010, 2012, 2014, 2018)
+## create vector of years in which fires occurred. 2000 excluded because no canopy data for that year. 
+F.yearslist <- c(2001, 2002, 2006, 2007, 2008, 2009, 2010, 2012, 2013, 2014, 2015, 2016, 2017)
+## initialize canopy height column
+bin_data$CH <- NA
+
+  for (i in 1:5) {
+    
+    if (i == 1) {
+      print("initializing function...")
+      pb1 <- pbCreate(5)
+    }
+    
+    print(paste0("starting iteration: ", i))
+    
+    filepath <- paste0("REMOTE/DATA/CH/CH_", CH.yearslist[i], ".tif")
+    years <- F.yearslist[F.yearslist >= CH.yearslist[i] & F.yearslist < (CH.yearslist[i+1])]
+    ch.raster <- raster(filepath)
+    bs <- blockSize(ch.raster)
+    pb2 <- pbCreate(bs$n)
+    
+    ## initialize dataframe
+    ch.df <- data.frame(CH = numeric(), x = numeric(), y = numeric())
+    
+    for (j in 1:bs$n) {
+      print(paste0("starting block", j, "of", bs$n))
+      extent <- extent(ch.raster, bs$row[j], (bs$row[j]+bs$nrows[j]-1), 1, 8900)
+      if (nrow(bin_data[bin_data$YEAR %in% years & bin_data$y >= extent[3] & bin_data$y <= extent[4], c("x", "y")]) > 0) {
+        crop.raster <- crop(ch.raster, extent)
+  
+        CH <- raster::extract(crop.raster, bin_data[bin_data$YEAR %in% years & bin_data$y >= extent[3] & bin_data$y <= extent[4], c("x", "y")])
+        
+        df.subr <- cbind(bin_data[bin_data$YEAR %in% years & bin_data$y >= extent[3] & bin_data$y <= extent[4], c("x", "y")], CH)
+        ch.df <- rbind(ch.df, df.subr)
+        rm(df.subr)
+        pbStep(pb2, j)
+      }
+      print(paste0("finished block", j, "of", bs$n))
+    }
+    pbClose(pb2)
+    
+    sub.df <- merge(bin_data[bin_data$YEAR %in% years, c("x", "y")], ch.df, by = c("x", "y"), all.x = TRUE)
+    bin_data[bin_data$YEAR %in% years, "CH"] <- sub.df$CH
+    
+    print(paste0("finished iteration: ", i))
+    pbStep(pb1, i)
+    
+    if (i == 5) {
+      pbClose(pb1)
+      print("function complete")
+    }
+  }
+
+```
+
+
+####2 Exploratory Data Analysis
+
+```{r}
+
+subsetdata <- sample_n(sub.bin_data, size = 500000)
+ggplot(data = subset(subsetdata, priv_dist < 1001), aes(x = priv_dist, y = HS)) +
+  geom_point() +
+  geom_smooth(method = 'glm', method.args = list(family = "binomial"))
+
+ggplot(data = subset(subsetdata, pub_dist < 1001), aes(x = pub_dist, y = HS)) +
+  geom_point() +
+  geom_smooth(method = 'glm', method.args = list(family = "binomial"))
+
+
+
+plot(ownership)
+
+## subset data for easier plotting
+ss.bin_data <- sample_n(sub.bin_data, size = 500000)
+
+## look at relationship between autocovariate and high-severity
+plot(ss.bin_data$acd_i_180, ss.bin_data$HS)
+
+ggplot(data = ss.bin_data, aes(y = HS)) +
+  geom_smooth(aes(x = ss.bin_data$acd_i_120, y = ss.bin_data$HS), color = "red") +
+  geom_smooth(aes(x = ss.bin_data$acd_i_60, y = ss.bin_data$HS), color = "blue") +
+  geom_smooth(aes(x = ss.bin_data$acd_i_180, y = ss.bin_data$HS), color = "green") +
+  geom_jitter(aes(x = ss.bin_data$acd_i_120, y = ss.bin_data$HS), color = "red", height = .001) +
+  geom_jitter(aes(x = ss.bin_data$acd_i_60, y = ss.bin_data$HS), color = "blue", height = .001) +
+  geom_jitter(aes(x = ss.bin_data$acd_i_180, y = ss.bin_data$HS), color = "green", height = .001)
+
+
+## look at relationship between YEAR and high severity
+ss.bin_data$YEAR <- as.factor(ss.bin_data$YEAR)
+
+ss.x <- aggregate(ss.bin_data, by = list(ss.bin_data$YEAR), FUN = mean)[, c("Group.1", "HS")]
+ss.bin_data$m.YEAR <- NA
+for (i in 1:nrow(ss.x)) {
+  ss.bin_data[ss.bin_data$YEAR == ss.x$Group.1[i], "m.YEAR"] <- ss.x[ss.x$Group.1 == ss.x$Group.1[i], "HS"]
+}
+
+ggplot(data = ss.bin_data, aes(x = YEAR, y = HS)) +
+  geom_jitter(height = .05, size = 0) +
+  geom_point(x = as.numeric(ss.bin_data$YEAR), y = ss.bin_data$m.YEAR) 
+
+
+## Slope and high severity
+ggplot(data = ss.bin_data, aes(x = slope, y = HS)) +
+  geom_point() +
+  geom_smooth()
+
+## Elevation and high severity
+ggplot(data = ss.bin_data, aes(x = elevation, y = HS)) +
+  geom_jitter(height = .001) +
+  geom_smooth(method = "lm") +
+  geom_smooth(method = "gam", formula = y~s(x, bs = "cs", sp = 1000))
+
+## latitude and high severity
+ggplot(data = ss.bin_data, aes(x = lat, y = HS)) +
+  geom_jitter(height = .001) +
+  geom_smooth(method = "lm") +
+  geom_smooth(method = "gam", formula = y~s(x, bs = "cs", sp = 1000))
+
+## heat load and high severity
+ggplot(data = ss.bin_data, aes(x = TPI_fine, y = HS)) +
+  geom_jitter(height = .001) +
+  geom_smooth(method = "lm") +
+  geom_smooth(method = "gam", formula = y~s(x, bs = "cs", sp = 1000))
+
+## TPI_course and high severity
+ggplot(data = ss.bin_data, aes(x = TPI_course, y = HS)) +
+  geom_jitter(height = .001) +
+  geom_smooth(method = "lm") +
+  geom_smooth(method = "gam", formula = y~s(x, bs = "cs", sp = 1000))
+
+
+```
+
+
+
+
+### Function to run mcmc for each fire
+
+```{r}
+
+
+assign.dist <- function(data) {
+  for (i in 1:nrow(data)) {
+    if (data$dum_own[i] == "1") {
+      data$dist[i] <- data$other_dist[i]
+    }
+    else if (data$dum_own[i] == "2") {
+      data$dist[i] <- data$priv_dist[i]
+    }
+    else {
+      data$dist[i] <- data$pub_dist[i]
+    }
+  }
+  return(data)
+}
+
+
+create.tunstarts <- function(n.own, rm.bi) {
+  if (n.own == 3) {
+    if (rm.bi == TRUE) {
+      tuning.starts <- list("beta" = c(2, .2, .21, 1.5, .13, .12, .11, .12, 2, 2), "phi" = .5, "sigma.sq" = .5, "w" = .5)
+    }
+    else {
+      tuning.starts <- list("beta" = c(2, .2, .21, 1.5, .13, .12, .11, .12, 2, 2, 2), "phi" = .5, "sigma.sq" = .5, "w" = .5)
+    }
+  }
+  else if (n.own == 2) {
+    if (rm.bi == TRUE) {
+      tuning.starts <- list("beta" = c(2, .2, 1.5, .13, .12, .11, .12, 2), "phi" = .5, "sigma.sq" = .5, "w" = .5)
+    }
+    else {
+      tuning.starts <- list("beta" = c(2, .2, 1.5, .13, .12, .11, .12, 2, 2), "phi" = .5, "sigma.sq" = .5, "w" = .5)
+    }
+  } 
+  else {
+    print("error: must have at least 2 ownership types")
+  }
+  return(tuning.starts)
+}
+
+create.betapriors <- function(n.own, rm.bi) {
+  if (n.own == 3) {
+    if (rm.bi == TRUE) {
+      beta.priors <- list(rep(0, times = 10), rep(100, times = 10))
+    }
+    else {
+      beta.priors <- list(rep(0, times = 11), rep(100, times = 11))
+    }
+  }
+  else if (n.own == 2) {
+    if (rm.bi == TRUE) {
+      beta.priors <- list(rep(0, times = 8), rep(100, times = 8))
+    }
+    else {
+      beta.priors <- list(rep(0, times = 9), rep(100, times = 9))
+    }
+  } 
+  else {
+    print("error: must have at least 2 ownership types")
+  }
+  return(beta.priors)
+}
+
+
+fire.modelrun <- function(n.batch = 400, batch.length = 50, n.knots = 200, scale.knots = TRUE, n.chains = 2, tuning.starts, data, inits, accept.rate = .42, beta.priors, rm.bi) {
+  
+  ## assign value for knot grid dimensions
+  if(scale.knots == TRUE) {
+    y.len <- max(data$y) - min(data$y)
+    x.len <- max(data$x) - min(data$x)
+    y.knots <- round(sqrt((y.len/x.len)*200), 0)
+    x.knots <- round(sqrt((x.len/y.len)*200), 0)
+    knots <- c(x.knots, y.knots)
+  }
+  else {
+    knots <- rep(round(sqrt(n.knots)), times = 2)
+  }
+  
+  if(rm.bi == FALSE) {
+    formula = as.formula("HS ~ dum_own*dist + slope.norm + heat_load.norm + TPI_fine.norm + max_bi.norm + CH.norm")
+  } else {
+    formula = as.formula("HS ~ dum_own*dist + slope.norm + heat_load.norm + TPI_fine.norm + CH.norm")
+  }
+  
+  spGLM.fun <- function(inits, tuning.starts) {
+    run <- spGLM(formula = formula,
+                 data = data,
+                 family = "binomial",
+                 coords = as.matrix(cbind(data$x, data$y)),
+                 knots = knots,
+                 tuning = tuning.starts,
+                 starting = list("beta" = inits$beta, 
+                                 "phi" = inits$phi, 
+                                 "sigma.sq" = inits$ss,
+                                 "w" = inits$w),
+                 priors = list("beta.normal" = beta.priors, 
+                               "phi.Unif" = c(1e-10, -log(.05)/1 ), 
+                               "sigma.sq.IG" = c(.001, .001)),
+                 cov.model = "exponential",
+                 amcmc=list("n.batch"=n.batch, 
+                            "batch.length"=batch.length, 
+                            "accept.rate"=accept.rate),
+                 verbose = TRUE,
+                 n.report = 10)
+    return(run)
+  }
+  
+  ## fit nonspatial glm to obtain starting parameter values:
+  if (missing(inits)) {
+    st.glm <- glm(formula, data = data, family = "binomial")
+    beta.starting <- coefficients(st.glm)
+    if (n.chains == 1) {
+      init.list <- list(beta = rmvn(1, beta.starting, vcov(st.glm)), phi = abs(rnorm(1, .0011, .0004)), ss = abs(rnorm(1, 6, 1)), w = 0)
+    } else if (n.chains == 2) {
+      init.list <- list(a = list(beta = rmvn(1, beta.starting, vcov(st.glm)), phi = abs(rnorm(1, .0011, .0004)), ss = abs(rnorm(1, 6, 1)), w = 0), b = list(beta = rmvn(1, beta.starting, vcov(st.glm)), phi = abs(rnorm(1, .0011, .0004)), ss = abs(rnorm(1, 6, 1)), w = 0))
+    } else {
+      print("function does not currently support more than 1 chain")
+    }
+  } else {
+    init.list <- inits
+  }
+  
+  if(n.chains > 1) {
+    fullrun <- mcmapply(FUN = spGLM.fun, init.list, tuning.starts, SIMPLIFY = FALSE, mc.cores = 8)
+  } else {
+    fullrun <- spGLM.fun(init.list[[1]], tuning.starts[[1]])
+  }
+  return(fullrun)
+}
+
+
+fire.mcmc <- function(fire, data = sub.bin_data, n.batch = 400, batch.length = 50, n.chains = 2, inits, tuning.starts, beta.priors, n.knots = 200, save = TRUE, filepath) {
+  
+  ##initialize model list
+  model.list <- list()
+  
+  ## define necessary parameters
+  
+  ## loop over each fire
+  for (i in 1:length(fire)) {
+    
+    print(paste0("starting: ", fire[i]))
+    
+    ## subsample data for individual fire
+    f.data <- data[data$VB_ID == fire[i],]
+    
+    ownership.mapping <- data.frame(ownership = c(0,1,2), dum_own = c(1,2,3))
+    
+    if (length(unique(f.data$ownership)) < 3) {
+      sampleset <- ownership.mapping[ownership.mapping$ownership %in% unique(f.data$ownership),"dum_own"] 
+    } else  {
+      sampleset <- 1:3
+    }
+    
+    f.data$dum_own <- as.factor(sample(sampleset, nrow(f.data), replace = TRUE)) ## generate random list of dummy variables for ownership assignment
+    
+    ## create empty column for dist-to-onwership type
+    f.data$dist <- rep(0, times = nrow(f.data))
+    
+    f.data[f.data$dum_own == 1, "dist"] <- f.data[f.data$dum_own == 1, "other_dist"]
+    f.data[f.data$dum_own == 2, "dist"] <- f.data[f.data$dum_own == 2, "priv_dist"]
+    f.data[f.data$dum_own == 3, "dist"] <- f.data[f.data$dum_own == 3, "pub_dist"]
+    
+    if (1 %in% sampleset) {
+      f.data$dum_own <- factor(f.data$dum_own, levels(f.data$dum_own)[c(2, 1, 3)])
+      
+    }
+    else {
+      f.data$dum_own <- factor(f.data$dum_own, levels(f.data$dum_own)[c(1, 2)])
+    }
+    
+   
+    f.data <- f.data[f.data$dist < 1000,] ## subset data to only include distances up to 1000 m
+    f.data$dist <- f.data$dist/1000
+    
+    ## sample 6000 points from dataset
+    s.data <- stratify(data = f.data, n = 2000)
+    
+    ## check that there is more than one value for burn index, some fires too small and have homogenous weather
+    if(length(unique(s.data$max_bi)) == 1) {
+      rm.bi <- TRUE
+    } else {
+      rm.bi <- FALSE
+      ## mean center and rescale burn index data to unit standard deviation
+      s.data$max_bi.norm <- (s.data$max_bi - mean(s.data$max_bi))/sd(s.data$max_bi)
+    }
+  
+    print(paste0("running MCMC for: ", fire[i]))
+    
+    ## create initial tuning numbers
+    if(missing(tuning.starts)) {
+      tuning.starts <- list(create.tunstarts(n.own = length(unique(s.data$dum_own)), rm.bi = rm.bi), create.tunstarts(n.own = length(unique(s.data$dum_own)), rm.bi = rm.bi))
+    }
+    
+    ## set beta priors depending on number of own params
+    if(missing(beta.priors)) {
+      beta.priors <- create.betapriors(n.own = length(unique(s.data$dum_own)), rm.bi = rm.bi)
+    }
+    
+    ## run MCMC
+    if(missing(inits)){
+      fullrun <- fire.modelrun(n.batch = n.batch, batch.length = batch.length, n.knots = n.knots, scale.knots = TRUE, n.chains = n.chains, data = s.data, tuning.starts = tuning.starts, beta.priors = beta.priors, rm.bi = rm.bi)
+    }
+    else {
+      fullrun <- fire.modelrun(n.batch = n.batch, batch.length = batch.length, n.knots = n.knots, scale.knots = TRUE, n.chains = n.chains, data = s.data, tuning.starts = tuning.starts, beta.priors = beta.priors, inits = inits, rm.bi = rm.bi)
+    }
+    ## print runtime
+    print(paste0("finished running MCMC for: ", fire[i]))
+    print(max(fullrun[[1]]$run.time, fullrun[[2]]$run.time))
+    
+    ## extract model information
+    model.list[[fire[i]]] <- fullrun
+    
+    ## extract chain information
+    n.samples <- n.batch*batch.length
+    burn.in <- .2*n.samples
+    sub.samps <- burn.in:n.samples
+
+    chains[[fire[i]]] <- mcmc.list(mcmc(fullrun[[1]]$p.beta.theta.samples[sub.samps,]), 
+                        mcmc(fullrun[[2]]$p.beta.theta.samples[sub.samps,]))
+    
+    
+    
+    if (grepl("/", fire[i])) {
+      fire_name <- sub("/", "_", fire[i])
+    }
+    else {
+      fire_name <- fire[i]
+    }
+    
+    if(save == TRUE) {
+      saveRDS(list(model.list = model.list, chains = chains), paste0(filepath, fire_name, "_model.rds"))
+    }
+    
+  }
+  return(list(model.list = model.list, chains = chains))
+}
+
+
+
+BAGLEY_retry <- fire.mcmc(fire = "BAGLEY_2012", data = sub.bin_data, n.chains = 2, n.batch = 400, save = FALSE)
+
+print(gelman.diag(mcmc.list(mcmc(BAGLEY_retry$model.list$BAGLEY_2012$a$p.beta.theta.samples[5000:20000,]), mcmc(BAGLEY_retry$model.list$BAGLEY_2012$b$p.beta.theta.samples[5000:20000,]))))
+
+"TENNANT_2009",
+
+fire.list <- c("STAR_2001", "AMERICAN_2013", "LITTLE DEER_2014", "MOONLIGHT_2007", "STEELE_2017", "BARRY POINT_2012", "FRIEND DARNELL_2008", "LOWELL_2015", "SUGARLOAF_2009", "ONION2_2008", "CONE_2002", "SCOTCHMAN_2008", "PANTHER_2013", "VENTURE_2008", "BULLARDS_2010", "WILLARD_2016", "TABLE_2017")
+
+fire.list <- c("VENTURE_2008", "BULLARDS_2010", "WILLARD_2016", "TABLE_2017")
+
+
+for (i in 1:length(fire.list)) {
+  fire <- fire.list[i]
+  f.mcmc <- try(fire.mcmc(fire = fire, data = sub.bin_data, n.chains = 2, n.batch = 400, save = TRUE, filepath = "REMOTE/DATA/FIRE_MODELS_eff/"))
+  if(class(f.mcmc) == "try-error") {
+    print(paste0(fire, " has encountered an error."))
+  } else {
+    print(gelman.diag(f.mcmc$chains[[fire]]))
+  }
+  rm(f.mcmc)
+  gc()
+}
+
+
+
+
+
+generate.starts <- function(fire.model, fire) {
+  tuning.betas.a <- exp(fire.model$model.list[[fire]]$a$tuning[,ncol(fire.model$model.list[[fire]]$a$tuning)])
+  tuning.knots.a <- exp(fire.model$model.list[[fire]]$a$tuning.w.knots[,ncol(fire.model$model.list[[fire]]$a$tuning)])
+  tuning.betas.b <- exp(fire.model$model.list[[fire]]$b$tuning[,ncol(fire.model$model.list[[fire]]$a$tuning)])
+  tuning.knots.b <- exp(fire.model$model.list[[fire]]$b$tuning.w.knots[,ncol(fire.model$model.list[[fire]]$a$tuning)])
+  
+  starting.betas.a <- fire.model$model.list[[fire]]$a$p.beta.theta.samples[nrow(fire.model$model.list[[fire]]$a$p.beta.theta.samples),]
+  starting.knots.a <- fire.model$model.list[[fire]]$a$p.w.knots.samples[,ncol(fire.model$model.list[[fire]]$a$p.w.knots.samples)]
+  starting.betas.b <- fire.model$model.list[[fire]]$b$p.beta.theta.samples[nrow(fire.model$model.list[[fire]]$b$p.beta.theta.samples),]
+  starting.knots.b <- fire.model$model.list[[fire]]$b$p.w.knots.samples[,ncol(fire.model$model.list[[fire]]$b$p.w.knots.samples)]
+  
+  tuning.list <- list(a = list("beta" = tuning.betas.a[1:(length(tuning.betas.a)-2)], "phi" = tuning.betas.a[length(tuning.betas.a)], "sigma.sq" = tuning.betas.a[length(tuning.betas.a)-1], "w" = tuning.knots.a),
+                      b = list("beta" = tuning.betas.b[1:(length(tuning.betas.b)-2)], "phi" = tuning.betas.b[length(tuning.betas.b)], "sigma.sq" = tuning.betas.b[length(tuning.betas.b)-1], "w" = tuning.knots.b))
+  
+  init.list <- list(a = list(beta = as.vector(starting.betas.a[1:(length(starting.betas.a)-2)]), phi = as.vector(starting.betas.a[length(starting.betas.a)]), ss = as.vector(starting.betas.a[length(starting.betas.a)-1]), w = as.vector(starting.knots.a)),
+                    b = list(beta = as.vector(starting.betas.b[1:(length(starting.betas.b)-2)]), phi = as.vector(starting.betas.b[length(starting.betas.b)]), ss = as.vector(starting.betas.b[length(starting.betas.b)-1]), w = as.vector(starting.knots.b)))
+  
+  return(list(tuning.list = tuning.list, init.list = init.list))
+}
+
+append.posterior.results <- function(old.model, new.model, fire) {
+  
+  old.model$model.list[[fire]]$a$tuning <- cbind(old.model$model.list[[fire]]$a$tuning, new.model$model.list[[fire]]$a$tuning)
+  old.model$model.list[[fire]]$a$tuning.w.knots <- cbind(old.model$model.list[[fire]]$a$tuning.w.knots, new.model$model.list[[fire]]$a$tuning.w.knots)
+  old.model$model.list[[fire]]$b$tuning <- cbind(old.model$model.list[[fire]]$b$tuning, new.model$model.list[[fire]]$b$tuning)
+  old.model$model.list[[fire]]$b$tuning.w.knots <- cbind(old.model$model.list[[fire]]$b$tuning.w.knots, new.model$model.list[[fire]]$b$tuning.w.knots)
+  
+  old.model$model.list[[fire]]$a$p.beta.theta.samples <- rbind(old.model$model.list[[fire]]$a$p.beta.theta.samples, new.model$model.list[[fire]]$a$p.beta.theta.samples)
+  old.model$model.list[[fire]]$a$p.w.knots.samples <- cbind(old.model$model.list[[fire]]$a$p.w.knots.samples, new.model$model.list[[fire]]$a$p.w.knots.samples)
+  old.model$model.list[[fire]]$b$p.beta.theta.samples <- rbind(old.model$model.list[[fire]]$b$p.beta.theta.samples, new.model$model.list[[fire]]$b$p.beta.theta.samples)
+  old.model$model.list[[fire]]$b$p.w.knots.samples <- cbind(old.model$model.list[[fire]]$b$p.w.knots.samples, new.model$model.list[[fire]]$b$p.w.knots.samples)
+  
+  old.model$model.list[[fire]]$a$acceptance <- cbind(old.model$model.list[[fire]]$a$acceptance, new.model$model.list[[fire]]$a$acceptance)
+  old.model$model.list[[fire]]$b$acceptance <- cbind(old.model$model.list[[fire]]$b$acceptance, new.model$model.list[[fire]]$b$acceptance)
+  
+  old.model$model.list[[fire]]$a$acceptance.w.knots <- cbind(old.model$model.list[[fire]]$a$acceptance.w.knots, new.model$model.list[[fire]]$a$acceptance.w.knots)
+  old.model$model.list[[fire]]$b$acceptance.w.knots <- cbind(old.model$model.list[[fire]]$b$acceptance.w.knots, new.model$model.list[[fire]]$b$acceptance.w.knots)
+  
+  return(old.model)
+}
+
+
+
+##"TENNANT_2009", "BARRY POINT_2012", "TRAILHEAD_2016", "RALSTON_2006", 
+
+fire.list <- c("AMERICAN_2013", "LITTLE DEER_2014", "MOONLIGHT_2007", "STEELE_2017", "BARRY POINT_2012", "FRIEND DARNELL_2008", "LOWELL_2015", "SUGARLOAF_2009", "ONION2_2008", "CONE_2002", "SCOTCHMAN_2008", "PANTHER_2013", "SMOKEY_2008", "VENTURE_2008", "BULLARDS_2010", "WILLARD_2016")
+
+for(i in 1:length(fire.list)) {
+  fire <- fire.list[i]
+  print(paste0("loading:", fire))
+  fire.model <- readRDS(paste0("REMOTE/DATA/FIRE_MODELS_eff/", fire, "_model.rds"))
+  n.samples <- nrow(fire.model$model.list[[fire]]$a$p.beta.theta.samples)
+  starts <- generate.starts(fire.model = fire.model, fire = fire)
+  n.mcmc <- fire.mcmc(fire = fire, data = sub.bin_data, n.batch = ((100000-n.samples)/50), batch.length = 50, n.chains = 2, inits = starts$init.list, tuning.starts = starts$tuning.list, save = FALSE)
+  fire.model <- append.posterior.results(old.model = fire.model, new.model = n.mcmc, fire = fire)
+  print(gelman.diag(mcmc.list(mcmc(fire.model$model.list[[fire]]$a$p.beta.theta.samples[5000:100000,]), mcmc(fire.model$model.list[[fire]]$b$p.beta.theta.samples[5000:100000,]))))
+  print(summary(mcmc.list(mcmc(fire.model$model.list[[fire]]$a$p.beta.theta.samples[5000:100000,]), mcmc(fire.model$model.list[[fire]]$b$p.beta.theta.samples[5000:100000,]))))
+  saveRDS(fire.model, paste0("REMOTE/DATA/FIRE_MODELS_eff/", fire, "_model.rds"))
+  rm(fire.model)
+}
+
+
+
+
+
+
+
+
+
+fire.list <- c("BAGLEY_2012", "KNIGHT_2009", "KING_2014", "FALL_2008", "TRAILHEAD_2016", "PIT_2008", "RIM_2013", "RALSTON_2006", "CORRAL_2008", "PONDEROSA_2017", "EILER_2014", "DAY_2014", "TENNANT_2009", "STAR_2001", "AMERICAN_2013", "LITTLE DEER_2014", "MOONLIGHT_2007", "STEELE_2017", "BARRY POINT_2012", "FRIEND DARNELL_2008", "LOWELL_2015", "SUGARLOAF_2009", "ONION2_2008", "CONE_2002", "SCOTCHMAN_2008", "PANTHER_2013", "SMOKEY_2008", "VENTURE_2008", "BULLARDS_2010", "WILLARD_2016", "TABLE_2017")
+
+
+
+coefs <- matrix(NA, ncol = 13, nrow = length(fire.list))
+coef.list <- c("(Intercept)", "dum_own2", "dum_own3", "dist", "slope.norm", "heat_load.norm", "TPI_fine.norm", "max_bi.norm", "CH.norm", "dum_own2:dist", "dum_own3:dist", "sigma.sq", "phi")
+
+for (i in 1:length(fire.list)) {
+  fire <- fire.list[i]
+  print(fire)
+  fire.model <- readRDS(paste0("REMOTE/DATA/FIRE_MODELS/", fire, "_model.rds"))
+  
+  sum <- summary(mcmc.list(mcmc(fire.model$model.list[[fire]]$a$p.beta.theta.samples[5000:40000,]), mcmc(fire.model$model.list[[fire]]$b$p.beta.theta.samples[5000:40000,])))  
+  
+  for (j in 1:length(coef.list)) {
+    if (coef.list[j] %in% row.names(sum$statistics)) {
+      coefs[i, j] <- sum$statistics[j]
+    }
+  }
+  rm(fire.model)
+      
+}
+
+other <- mean(coefs[1:17,1])
+priv <- mean((coefs[1:17,1]) + coefs[1:17, 2])
+pub <- mean(coefs[1:17, 1] + coefs[1:17, 3])
+
+otherd <- mean(coefs[1:17,4])
+privd <- mean((coefs[1:17,4]) + coefs[1:17, 10])
+pubd <- mean(coefs[1:17, 1] + coefs[1:17, 11])
+
+
+
+c <- matrix(NA, ncol = 1, nrow = length(fire.list))
+for (i in 1:length(fire.list)) {
+  fire <- fire.list[i]
+  print(fire)
+  fire.model <- readRDS(paste0("REMOTE/DATA/FIRE_MODELS/", fire, "_model.rds"))
+  
+  gd <- gelman.diag(mcmc.list(mcmc(fire.model$model.list[[fire]]$a$p.beta.theta.samples[5000:40000,]), mcmc(fire.model$model.list[[fire]]$b$p.beta.theta.samples[5000:40000,])))
+  
+  c[i] <- gd$mpsrf
+      
+}
+
+
+
+
+
+
+
+tracfor(i in 1:length(fire.list)) {
+  fire <- fire.list[i]
+  
+  print(paste0("loading:", fire))
+  fire.model <- readRDS(paste0("REMOTE/DATA/FIRE_MODELS/", fire, "_model.rds"))
+  
+  n.iter <- 1
+  
+  repeat {
+    ch <- mcmc.list(mcmc(fire.model$model.list[[fire]]$a$p.beta.theta.samples[(nrow(fire.model$model.list[[fire]]$a$p.beta.theta.samples)-18000):nrow(fire.model$model.list[[fire]]$a$p.beta.theta.samples),]), 
+                        mcmc(fire.model$model.list[[fire]]$b$p.beta.theta.samples[(nrow(fire.model$model.list[[fire]]$b$p.beta.theta.samples)-18000):nrow(fire.model$model.list[[fire]]$b$p.beta.theta.samples),]))
+  
+    n.gd <- gelman.diag(ch)
+    print(paste0("current mgd = ", n.gd$mpsrf))
+    
+    if(n.gd$mpsrf < 1.2) {
+      print(paste0("iteration: ", n.iter, "succeeded"))
+      break
+    }
+    print(paste0("iteration: ", n.iter, " failed"))
+    n.iter <- n.iter+1
+    
+    starts <- generate.starts(fire.model = fire.model, fire = fire)
+  
+    n.mcmc <- fire.mcmc(fire = fire, data = sub.bin_data, n.batch = 4, batch.length = 50, n.chains = 2, inits = starts$init.list, tuning.starts = starts$tuning.list, save = FALSE)
+  
+    fire.model <- append.posterior.results(old.model = fire.model, new.model = n.mcmc, fire = fire)
+    
+  }
+  
+
+  saveRDS(fire.model, paste0("REMOTE/DATA/FIRE_MODELS/", fire, "_model.rds"))  
+}
+
+
+
+
+print(gelman.diag(mcmc.list(mcmc(KING_2014_model$model.list[["KING_2014"]]$a$p.beta.theta.samples[2000:20000,]), mcmc(KING_2014_model$model.list[["KING_2014"]]$b$p.beta.theta.samples[2000:20000,]))))
+
+```
+
+
+
+
+
